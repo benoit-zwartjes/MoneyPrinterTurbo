@@ -16,6 +16,9 @@ MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
 MAX_SCRIPT_PROMPT_LENGTH = 2000
 MAX_SCRIPT_SYSTEM_PROMPT_LENGTH = 8000
+MIN_TRENDING_TOPIC_COUNT = 1
+MAX_TRENDING_TOPIC_COUNT = 50
+MAX_TRENDING_INPUT_LENGTH = 2000
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _UNCLOSED_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
 _URL_USERINFO_RE = re.compile(
@@ -703,6 +706,235 @@ Please note that you must use English for generating video search terms; Chinese
     logger.success(f"completed: \n{search_terms}")
     return search_terms
 
+
+# =============================================================================
+# Trending topics
+#
+# 把短视频平台的热门标签转换成可以直接生成视频的具体选题。热榜条目本身通常
+# 不是选题：一部分只描述分发位置或剪辑工具，另一部分绑定了特定音乐、舞蹈或
+# 挑战，素材库无法还原。这里先做本地清洗，再让模型只从剩余条目里提炼选题。
+# =============================================================================
+
+# 只描述分发位置、互动形式或剪辑工具的标签不含任何选题信息。保留它们会让模型
+# 据此编造主题，因此在拼接提示词之前就过滤掉，同时减少无效 token。
+MECHANICAL_TREND_TAGS = frozenset(
+    {
+        "capcut",
+        "duet",
+        "explore",
+        "explorepage",
+        "fy",
+        "fyp",
+        "fypage",
+        "fypシ",
+        "foryou",
+        "foryoupage",
+        "greenscreen",
+        "stitch",
+        "tiktok",
+        "trend",
+        "trending",
+        "viral",
+        "viralvideo",
+        "xyzbca",
+    }
+)
+
+
+# 行内可能并排写多个标签，需要逐个提取；标签在空白、``#`` 或逗号处结束。
+_TREND_HASHTAG_RE = re.compile(r"#([^\s#,]+)")
+# 榜单前缀形如 "1." / "12)" / "3 -"。只匹配带分隔符的排名，避免把
+# "2024recap" 这类以数字开头的标签截断成 "recap"。
+_TREND_RANK_PREFIX_RE = re.compile(r"^\s*\d{1,3}\s*[.)\-]\s*")
+# 数量列形如 "892K posts" / "1.2M views"。
+_TREND_COUNT_SUFFIX_RE = re.compile(
+    r"\s+\d[\d.,]*\s*[KMB]?\s*(?:posts?|views?)?\s*$", re.IGNORECASE
+)
+
+
+def _normalize_trending_topic_count(amount: int | None) -> int:
+    """把请求的选题数量夹到受支持的区间。"""
+    try:
+        value = int(amount or MIN_TRENDING_TOPIC_COUNT)
+    except (TypeError, ValueError):
+        value = MIN_TRENDING_TOPIC_COUNT
+
+    if value < MIN_TRENDING_TOPIC_COUNT or value > MAX_TRENDING_TOPIC_COUNT:
+        # WebUI 会限制滑块范围；这里兜底处理 API 和内部调用，避免异常参数
+        # 直接放大 LLM 成本或让模型返回空结果。
+        logger.warning(
+            f"trending topic amount is out of range and will be clamped: {value}"
+        )
+        return max(
+            MIN_TRENDING_TOPIC_COUNT, min(value, MAX_TRENDING_TOPIC_COUNT)
+        )
+
+    return value
+
+
+def parse_trending_input(raw_trends: str) -> List[str]:
+    """
+    把粘贴的热榜文本整理成去重后的标签列表。
+
+    需要同时容忍两种常见来源：榜单页面按行复制（"1. #tag 892K posts"），
+    以及标题或评论里一行并排写多个标签（"#a #b #c"）。因此先按行处理，
+    行内出现 ``#`` 时提取该行的全部标签，否则整行按一个话题短语处理。
+    统一在本地清洗可以去掉无选题信息的机械标签、避免重复占用 token，
+    并在没有任何可用标签时不发起 LLM 请求。
+    """
+    raw_trends = _limit_script_text(
+        raw_trends, MAX_TRENDING_INPUT_LENGTH, "raw_trends"
+    )
+
+    tags: List[str] = []
+    seen: set[str] = set()
+
+    def add_tag(tag: str) -> None:
+        tag = tag.strip().strip("#").strip()
+        if not tag:
+            return
+        key = tag.casefold()
+        if key in MECHANICAL_TREND_TAGS or key in seen:
+            return
+        seen.add(key)
+        tags.append(tag)
+
+    for row in raw_trends.splitlines():
+        row = row.strip()
+        if not row:
+            continue
+
+        # 一行里可以并排写多个标签，必须全部提取。只取第一个会在首个标签
+        # 恰好是 #fyp 这类机械标签时，把整行真正有效的标签一起丢掉。
+        hashtags = _TREND_HASHTAG_RE.findall(row)
+        if hashtags:
+            for tag in hashtags:
+                add_tag(tag)
+            continue
+
+        # 没有 ``#`` 时按逗号分段，并去掉榜单的排名前缀与数量列。整段保留，
+        # 这样 "urban farming" 这类多词话题不会被截成第一个单词。
+        for chunk in row.split(","):
+            chunk = _TREND_RANK_PREFIX_RE.sub("", chunk.strip())
+            chunk = _TREND_COUNT_SUFFIX_RE.sub("", chunk).strip()
+            add_tag(chunk)
+
+    return tags
+
+
+def build_trending_topics_prompt(
+    trends: List[str],
+    amount: int = 5,
+    language: str = "",
+) -> str:
+    """拼接把热门标签转成具体选题的提示词。"""
+    amount = _normalize_trending_topic_count(amount)
+    joined_trends = "\n".join(f"- {tag}" for tag in trends)
+
+    prompt = f"""
+# Role: Short Video Topic Planner
+
+## Goals:
+Turn the trending hashtags below into {amount} concrete video subjects for
+short narrated videos built from stock footage.
+
+## Constrains:
+1. the subjects are to be returned as a json-array of strings.
+2. you must only return the json-array of strings. you must not return anything else.
+3. each subject must be one specific sentence a narrator can research and explain.
+4. only use entries that carry real subject matter. ignore entries that name a
+   song, a dance, a challenge, or a specific creator, because stock footage
+   cannot reproduce them.
+5. ignore entries that are breaking news, named individuals, sports fixtures,
+   deaths, or legal cases. automated trend feeds are dominated by these and
+   stock footage cannot illustrate them responsibly.
+6. an entry naming a person or event may still be used if you generalise it into
+   the durable topic behind it. example: a named earthquake becomes how
+   earthquakes are measured.
+7. prefer subjects that stock footage can illustrate: places, nature, food, work,
+   technology, animals, travel, fitness, science.
+8. do not invent a subject that is unrelated to every entry provided.
+
+## Output Example:
+["subject 1", "subject 2", "subject 3", "subject 4", "subject 5"]
+
+## Context:
+### Trending Entries
+{joined_trends}
+""".strip()
+
+    if language:
+        prompt += f"\n\nWrite the subjects in this language: {language}"
+
+    return prompt
+
+
+def generate_topics_from_trends(
+    raw_trends: str,
+    amount: int = 5,
+    language: str = "",
+    app_config=None,
+) -> List[str]:
+    """
+    把粘贴的热榜文本转换成可直接用于生成视频的选题列表。
+
+    返回值语义与 generate_terms 保持一致：任何失败都返回空列表，让调用方在
+    真实故障位置提示用户，而不是把错误文案当成选题继续往下走。
+    """
+    trends = parse_trending_input(raw_trends)
+    if not trends:
+        logger.warning("no usable trending hashtags were provided")
+        return []
+
+    amount = _normalize_trending_topic_count(amount)
+    prompt = build_trending_topics_prompt(trends, amount=amount, language=language)
+    logger.info(f"trending tags: {len(trends)}, requested subjects: {amount}")
+
+    topics: List[str] = []
+    response = ""
+    for i in range(_max_retries):
+        try:
+            if app_config is None:
+                response = _generate_response(prompt)
+            else:
+                response = _generate_response(prompt, app_config=app_config)
+            if response.startswith("Error: "):
+                # 与 generate_terms 一致：公开返回类型是 List[str]，把错误文案
+                # 原样返回会让只做空值判断的调用方把它当成一条有效选题。
+                logger.error(f"failed to generate trending topics: {response}")
+                return []
+            parsed = json.loads(_strip_code_fence(response))
+            if not isinstance(parsed, list) or not all(
+                isinstance(topic, str) for topic in parsed
+            ):
+                logger.error("response is not a list of strings.")
+                continue
+            topics = [topic.strip() for topic in parsed if topic.strip()]
+
+        except Exception as e:
+            logger.warning(f"failed to generate trending topics: {str(e)}")
+            if response:
+                match = re.search(r"\[.*]", response, re.DOTALL)
+                if match:
+                    try:
+                        parsed = json.loads(match.group())
+                        topics = [
+                            topic.strip()
+                            for topic in parsed
+                            if isinstance(topic, str) and topic.strip()
+                        ]
+                    except Exception as e:
+                        # 记录模型返回的非标准 JSON，便于区分是格式问题
+                        # 还是解析逻辑问题。
+                        logger.warning(f"failed to generate trending topics: {str(e)}")
+
+        if topics:
+            break
+        if i < _max_retries - 1:
+            logger.warning(f"failed to generate trending topics, trying again... {i + 1}")
+
+    logger.success(f"completed: \n{topics}")
+    return topics[:amount]
 
 # =============================================================================
 # Social publishing metadata

@@ -1926,5 +1926,211 @@ class TestRetryWarningBoundary(unittest.TestCase):
         )
 
 
+class TestTrendingTopics(unittest.TestCase):
+    def test_parse_trending_input_cleans_pasted_trend_list(self):
+        """
+        用户通常直接从热榜页面整段复制，因此解析必须容忍排名序号、``#``
+        前缀和 "1.2M posts" 这类计数列，并且按大小写不敏感去重。
+        """
+        raw = (
+            "1. #icelandtravel 892K posts\n"
+            "2. #SourdoughStarter\n"
+            "#icelandtravel\n"
+            "  #deepseacreatures 1.2M posts, #urbanfarming\n"
+        )
+
+        self.assertEqual(
+            llm.parse_trending_input(raw),
+            [
+                "icelandtravel",
+                "SourdoughStarter",
+                "deepseacreatures",
+                "urbanfarming",
+            ],
+        )
+
+    def test_parse_trending_input_keeps_every_tag_on_one_line(self):
+        """
+        标题和评论区常见的写法是一行并排多个标签。只取第一个标签时，
+        只要首位恰好是 #fyp 这类机械标签，整行有效标签都会被丢掉，
+        界面就会错误地提示“没有可用标签”。
+        """
+        self.assertEqual(
+            llm.parse_trending_input("#fyp #icelandtravel #volcano"),
+            ["icelandtravel", "volcano"],
+        )
+
+    def test_parse_trending_input_extracts_tags_from_surrounding_prose(self):
+        self.assertEqual(
+            llm.parse_trending_input("Check this out #icelandtravel #geology #fyp"),
+            ["icelandtravel", "geology"],
+        )
+
+    def test_parse_trending_input_keeps_tags_starting_with_digits(self):
+        """排名前缀清理不能误伤以数字开头的标签。"""
+        self.assertEqual(
+            llm.parse_trending_input("#2024recap\n#90snostalgia"),
+            ["2024recap", "90snostalgia"],
+        )
+
+    def test_parse_trending_input_keeps_multiword_topics_without_hashes(self):
+        """不带 ``#`` 的整行是一个话题短语，不能截断成第一个单词。"""
+        self.assertEqual(
+            llm.parse_trending_input("urban farming\ndeep sea creatures"),
+            ["urban farming", "deep sea creatures"],
+        )
+
+    def test_parse_trending_input_drops_mechanical_tags(self):
+        """
+        #fyp 这类标签只描述分发位置，不含选题信息。保留它们会让模型据此
+        编造主题，因此必须在拼接提示词之前就过滤掉。
+        """
+        self.assertEqual(
+            llm.parse_trending_input("#fyp\n#viral\n#CapCut\n#foryoupage"), []
+        )
+
+    def test_generate_topics_from_trends_skips_llm_when_no_usable_tag(self):
+        """
+        全部是机械标签时不存在可用输入，必须直接返回空列表，
+        避免为一次注定失败的生成付出模型调用成本。
+        """
+        with patch.object(llm, "_generate_response") as generate:
+            result = llm.generate_topics_from_trends("#fyp\n#viral", amount=3)
+
+        self.assertEqual(result, [])
+        generate.assert_not_called()
+
+    def test_generate_topics_from_trends_returns_subjects(self):
+        captured = {}
+
+        def fake_generate_response(prompt, app_config=None):
+            captured["prompt"] = prompt
+            return '["Why Iceland beaches are black", "How sourdough starters work"]'
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ):
+            result = llm.generate_topics_from_trends(
+                "#icelandtravel\n#sourdoughstarter", amount=2
+            )
+
+        self.assertEqual(
+            result,
+            ["Why Iceland beaches are black", "How sourdough starters work"],
+        )
+        self.assertIn("icelandtravel", captured["prompt"])
+        self.assertIn("stock footage", captured["prompt"])
+
+    def test_generate_topics_from_trends_returns_empty_list_on_provider_error(self):
+        """
+        公开返回类型是 List[str]。把 Provider 错误文案原样返回，会让只做
+        空值判断的调用方把整句报错当成一条有效选题填进视频主题。
+        """
+        with patch.object(
+            llm, "_generate_response", return_value="Error: invalid api key"
+        ):
+            result = llm.generate_topics_from_trends("#icelandtravel", amount=3)
+
+        self.assertEqual(result, [])
+
+    def test_generate_topics_from_trends_never_exceeds_requested_amount(self):
+        """模型可能忽略数量约束，服务层必须裁剪，避免界面出现超量候选。"""
+        with patch.object(
+            llm,
+            "_generate_response",
+            return_value='["a", "b", "c", "d", "e"]',
+        ):
+            result = llm.generate_topics_from_trends("#icelandtravel", amount=2)
+
+        self.assertEqual(result, ["a", "b"])
+
+    def test_generate_topics_from_trends_recovers_json_from_prose(self):
+        """部分 Provider 会在数组前后附带说明文字，需要回退到正则提取。"""
+        with patch.object(
+            llm,
+            "_generate_response",
+            return_value='Sure! ["Why volcanoes erupt"] Hope this helps.',
+        ):
+            result = llm.generate_topics_from_trends("#volcano", amount=1)
+
+        self.assertEqual(result, ["Why volcanoes erupt"])
+
+    def test_trending_topic_count_is_clamped(self):
+        self.assertEqual(
+            llm._normalize_trending_topic_count(0), llm.MIN_TRENDING_TOPIC_COUNT
+        )
+        self.assertEqual(
+            llm._normalize_trending_topic_count(99), llm.MAX_TRENDING_TOPIC_COUNT
+        )
+        self.assertEqual(
+            llm._normalize_trending_topic_count(None), llm.MIN_TRENDING_TOPIC_COUNT
+        )
+
+    def test_generate_topics_from_trends_uses_the_supplied_config_snapshot(self):
+        """
+        WebUI 始终传入配置快照。这条路径必须把快照透传给 Provider 调用，
+        否则后台视频任务结束并写回配置时，选题会突然切换到另一个 Provider。
+        """
+        snapshot = {"llm_provider": "openai"}
+        captured = {}
+
+        def fake_generate_response(prompt, app_config=None):
+            captured["app_config"] = app_config
+            return '["Why volcanoes erupt"]'
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ):
+            result = llm.generate_topics_from_trends(
+                "#volcano", amount=1, app_config=snapshot
+            )
+
+        self.assertEqual(result, ["Why volcanoes erupt"])
+        self.assertIs(captured["app_config"], snapshot)
+
+    def test_generate_topics_from_trends_rejects_non_string_items(self):
+        """模型可能返回对象数组，服务层必须拒绝而不是把 dict 填进主题框。"""
+        with patch.object(
+            llm, "_generate_response", return_value='[{"subject": "nope"}]'
+        ):
+            result = llm.generate_topics_from_trends("#volcano", amount=1)
+
+        self.assertEqual(result, [])
+
+    def test_generate_topics_from_trends_retries_until_a_valid_response(self):
+        responses = ["not json at all", '["Why volcanoes erupt"]']
+
+        with patch.object(llm, "_generate_response", side_effect=responses):
+            result = llm.generate_topics_from_trends("#volcano", amount=1)
+
+        self.assertEqual(result, ["Why volcanoes erupt"])
+
+    def test_generate_topics_from_trends_survives_malformed_recovered_json(self):
+        """正则兜底提取到的片段仍可能不是合法 JSON，此时不能抛出异常。"""
+        with patch.object(
+            llm, "_generate_response", return_value='prefix ["unterminated, ] suffix'
+        ):
+            result = llm.generate_topics_from_trends("#volcano", amount=1)
+
+        self.assertEqual(result, [])
+
+    def test_trending_topic_count_clamps_non_numeric_values(self):
+        self.assertEqual(
+            llm._normalize_trending_topic_count("many"), llm.MIN_TRENDING_TOPIC_COUNT
+        )
+
+    def test_parse_trending_input_ignores_blank_and_symbol_only_entries(self):
+        self.assertEqual(
+            llm.parse_trending_input("\n#\n   \n2.\n#volcano\n"), ["volcano"]
+        )
+
+    def test_build_trending_topics_prompt_requests_language(self):
+        prompt = llm.build_trending_topics_prompt(
+            ["icelandtravel"], amount=3, language="zh-CN"
+        )
+        self.assertIn("zh-CN", prompt)
+        self.assertIn("3 concrete video subjects", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

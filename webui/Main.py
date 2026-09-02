@@ -51,6 +51,8 @@ from app.services import (
     material,
     video,
     ofox,
+    topic_backlog,
+    trend_sources,
     volcengine_seedance,
     voice,
     webui_task,
@@ -488,6 +490,11 @@ def _initialize_session_state():
         "video_subject": "",
         "video_script": "",
         "video_terms": "",
+        "trending_hashtags": "",
+        "trend_region_input": trend_sources.DEFAULT_REGION,
+        "trend_fetch_failed": False,
+        "trending_topic_count": 5,
+        "trending_topic_results": [],
         "paragraph_number_input": _saved_ui_number(
             "paragraph_number",
             1,
@@ -735,6 +742,33 @@ def _remove_active_generation_task(task_id):
         del tasks[task_id]
     if st.session_state.get("pending_generation_task_id") == task_id:
         del st.session_state["pending_generation_task_id"]
+
+
+def _settle_generation_task(task_id, state, task=None):
+    """
+    任务结束时收尾，并在成功时把对应选题标记为已产出。
+
+    只有 COMPLETE 才标记：失败的任务没有视频产出，如果一并标记，用户会误以为
+    这条选题已经拍过而不再重试。选题优先取本次会话提交时记录的值，回退到任务
+    自身保存的参数，这样刷新页面后仍然能正确归档。
+    """
+    if state == const.TASK_STATE_COMPLETE:
+        subject = (_active_generation_tasks().get(task_id) or {}).get("subject") or ""
+        if not subject and isinstance(task, dict):
+            params = task.get("params") or {}
+            if isinstance(params, dict):
+                subject = params.get("video_subject") or ""
+        if subject and subject != task_id:
+            try:
+                topic_backlog.mark_made(subject, task_id)
+            except Exception as exc:
+                # 归档失败不能影响用户看到已经生成好的视频。
+                logger.warning(
+                    f"failed to mark backlog subject as made: "
+                    f"task_id={task_id}, error={exc}"
+                )
+
+    _remove_active_generation_task(task_id)
 
 
 def _prepare_generation_task():
@@ -1857,7 +1891,7 @@ def _render_running_generation_task(task_id):
 
     state = _normalize_task_state((task or {}).get("state"))
     if state in {const.TASK_STATE_COMPLETE, const.TASK_STATE_FAILED}:
-        _remove_active_generation_task(task_id)
+        _settle_generation_task(task_id, state, task)
         # 完整页面脚本现在没有耗时生成逻辑，可以安全 rerun 并把结果改为静态
         # 渲染。这样任务结束后不会让浏览器永久保留一个两秒轮询的 Fragment。
         st.rerun(scope="app")
@@ -1882,7 +1916,7 @@ def _render_current_generation_task():
 
     state = _normalize_task_state((task or {}).get("state"))
     if state in {const.TASK_STATE_COMPLETE, const.TASK_STATE_FAILED}:
-        _remove_active_generation_task(task_id)
+        _settle_generation_task(task_id, state, task)
         _render_generation_task_snapshot(task_id, task)
         return
 
@@ -4109,6 +4143,262 @@ def _render_loomloom_script_generation(params):
     _render_loomloom_candidates()
 
 
+# 来源名称是产品名，不随界面语言变化。format_func 必须是纯函数：它会在
+# 控件状态收集阶段被调用，此时读取 session_state（例如 tr()）并不安全。
+_TREND_SOURCE_LABELS = {
+    trend_sources.SOURCE_WIKIPEDIA: "Wikipedia most-read",
+    trend_sources.SOURCE_GOOGLE_TRENDS: "Google Trends daily",
+}
+
+
+def _fetch_trending_tags():
+    """
+    拉取所选来源的热榜条目并填入输入框。
+
+    在 on_click 回调里执行，才能写 trending_hashtags 这个控件的 session_state。
+    拉取失败只记录状态、保留输入框原内容，用户仍可手动粘贴。
+    """
+    source = st.session_state.get(
+        localized_widget_key("trend_source_select"), trend_sources.SOURCE_WIKIPEDIA
+    )
+    region = st.session_state.get("trend_region_input", trend_sources.DEFAULT_REGION)
+    try:
+        tags = trend_sources.fetch_trending_tags(
+            source, region=region, limit=trend_sources.DEFAULT_LIMIT
+        )
+    except Exception as exc:
+        # 服务层已经处理了预期的网络异常，这里是回调的最后保护边界。
+        logger.warning(f"unexpected error while fetching trending topics: {exc}")
+        tags = []
+
+    if tags:
+        st.session_state["trending_hashtags"] = "\n".join(tags)
+        st.session_state["trend_fetch_failed"] = False
+    else:
+        st.session_state["trend_fetch_failed"] = True
+
+
+def _use_trending_subject(subject):
+    """把选中的热榜选题填入视频主题输入框。
+
+    Streamlit 只允许在控件实例化之前修改它的 session_state 值，而 on_click
+    回调正是在下一次脚本重跑之前执行，因此这里可以直接写 video_subject。
+    """
+    st.session_state["video_subject"] = subject
+
+
+def _mark_backlog_subject_made(subject):
+    topic_backlog.mark_made(subject)
+
+
+def _mark_backlog_subject_pending(subject):
+    topic_backlog.mark_pending(subject)
+
+
+def _remove_backlog_subject(subject):
+    topic_backlog.remove_subject(subject)
+
+
+def _clear_made_backlog_subjects():
+    topic_backlog.clear_made()
+
+
+def _render_subject_backlog(params):
+    """
+    渲染跨会话保留的选题清单。
+
+    清单的价值在于"上次生成的还没拍完"，因此状态存磁盘而不是 session_state：
+    后者会在刷新或重启后清空。已产出的选题默认折叠，避免待办被历史记录淹没。
+    """
+    entries = topic_backlog.load_backlog()
+    pending = [e for e in entries if e["status"] == topic_backlog.STATUS_PENDING]
+    made = [e for e in entries if e["status"] == topic_backlog.STATUS_MADE]
+
+    with st.container(key="subject_backlog_panel"):
+        with st.expander(
+            tr("Subject Backlog").format(pending=len(pending), made=len(made)),
+            expanded=bool(pending),
+        ):
+            if not entries:
+                st.caption(tr("Subject Backlog Empty"))
+                return
+
+            if not pending:
+                st.caption(tr("Subject Backlog All Made"))
+
+            for index, entry in enumerate(pending):
+                subject = entry["subject"]
+                with st.container(
+                    key=f"backlog_pending_row_{index}",
+                    horizontal=True,
+                    vertical_alignment="center",
+                    gap="small",
+                ):
+                    st.markdown(subject, width="stretch")
+                    st.button(
+                        tr("Use This Subject"),
+                        key=f"backlog_use_{index}",
+                        type="tertiary",
+                        on_click=_use_trending_subject,
+                        args=(subject,),
+                    )
+                    st.button(
+                        tr("Mark Subject Made"),
+                        key=f"backlog_made_{index}",
+                        type="tertiary",
+                        help=tr("Mark Subject Made Help"),
+                        on_click=_mark_backlog_subject_made,
+                        args=(subject,),
+                    )
+                    st.button(
+                        tr("Remove Subject"),
+                        key=f"backlog_remove_{index}",
+                        type="tertiary",
+                        on_click=_remove_backlog_subject,
+                        args=(subject,),
+                    )
+
+            if not made:
+                return
+
+            with st.expander(
+                tr("Made Subjects").format(count=len(made)), expanded=False
+            ):
+                for index, entry in enumerate(made):
+                    subject = entry["subject"]
+                    with st.container(
+                        key=f"backlog_made_row_{index}",
+                        horizontal=True,
+                        vertical_alignment="center",
+                        gap="small",
+                    ):
+                        st.markdown(f":gray[~~{subject}~~]", width="stretch")
+                        st.button(
+                            tr("Restore Subject"),
+                            key=f"backlog_restore_{index}",
+                            type="tertiary",
+                            help=tr("Restore Subject Help"),
+                            on_click=_mark_backlog_subject_pending,
+                            args=(subject,),
+                        )
+                st.button(
+                    tr("Clear Made Subjects"),
+                    key="backlog_clear_made",
+                    type="tertiary",
+                    use_container_width=True,
+                    on_click=_clear_made_backlog_subjects,
+                )
+
+
+def _render_trending_topics(params):
+    """把粘贴的平台热榜标签转换成候选选题，并支持一键填入视频主题。"""
+    with st.container(key="trending_topics_panel"):
+        with st.expander(tr("Trending Topics"), expanded=False):
+            st.caption(tr("Trending Topics Help"))
+
+            with st.container(
+                key="trend_fetch_row",
+                horizontal=True,
+                vertical_alignment="bottom",
+                gap="small",
+            ):
+                stable_selectbox(
+                    tr("Trend Source"),
+                    options=list(trend_sources.TREND_SOURCES),
+                    default_value=trend_sources.SOURCE_WIKIPEDIA,
+                    key="trend_source_select",
+                    format_func=lambda value: _TREND_SOURCE_LABELS.get(value, value),
+                    help=tr("Trend Source Help"),
+                )
+                st.text_input(
+                    tr("Trend Region"),
+                    max_chars=2,
+                    key="trend_region_input",
+                    help=tr("Trend Region Help"),
+                )
+                st.button(
+                    tr("Fetch Trending"),
+                    key="fetch_trending_tags",
+                    icon=":material/download:",
+                    on_click=_fetch_trending_tags,
+                )
+
+            if st.session_state.get("trend_fetch_failed"):
+                st.warning(tr("Trend Fetch Failed"))
+
+            raw_trends = st.text_area(
+                tr("Trending Hashtags"),
+                placeholder=tr("Trending Hashtags Placeholder"),
+                height=120,
+                key="trending_hashtags",
+            )
+            topic_count = st.slider(
+                tr("Trending Topic Count"),
+                min_value=llm.MIN_TRENDING_TOPIC_COUNT,
+                max_value=llm.MAX_TRENDING_TOPIC_COUNT,
+                key="trending_topic_count",
+            )
+            if st.button(
+                tr("Generate Subjects From Trends"),
+                key="generate_trending_topics",
+                use_container_width=True,
+                type="secondary",
+                icon=":material/trending_up:",
+            ):
+                # 先在本地清洗一次。全部是 #fyp 这类机械标签时不含任何选题信息，
+                # 直接提示用户，避免发起一次必然得不到有效结果的模型请求。
+                if not llm.parse_trending_input(raw_trends):
+                    st.session_state["trending_topic_results"] = []
+                    st.toast(tr("No Usable Trending Hashtags"))
+                    st.warning(tr("No Usable Trending Hashtags"))
+                else:
+                    with st.spinner(tr("Generating Trending Topics")):
+                        topics = _run_llm_read_operation(
+                            "generate_topics_from_trends",
+                            lambda app_config_snapshot: (
+                                llm.generate_topics_from_trends(
+                                    raw_trends,
+                                    amount=topic_count,
+                                    language=params.video_language,
+                                    app_config=app_config_snapshot,
+                                )
+                            ),
+                        )
+                    st.session_state["trending_topic_results"] = topics
+                    if not topics:
+                        st.error(tr("Trending Topics Generation Failed"))
+                    else:
+                        # 直接进选题清单。清单按大小写不敏感去重，因此重复运行
+                        # 热榜生成不会把已经拍过的选题重新排回待办。
+                        added = topic_backlog.add_subjects(topics)
+                        st.toast(
+                            tr("Subjects Added To Backlog").format(
+                                added=added, total=len(topics)
+                            )
+                        )
+
+            results = list(st.session_state.get("trending_topic_results") or ())
+            if not results:
+                return
+
+            st.caption(tr("Trending Topics Result Help"))
+            for index, subject in enumerate(results):
+                with st.container(
+                    key=f"trending_topic_row_{index}",
+                    horizontal=True,
+                    vertical_alignment="center",
+                    gap="small",
+                ):
+                    st.markdown(subject, width="stretch")
+                    st.button(
+                        tr("Use This Subject"),
+                        key=f"use_trending_topic_{index}",
+                        type="tertiary",
+                        on_click=_use_trending_subject,
+                        args=(subject,),
+                    )
+
+
 def _render_script_settings(panel, params):
     """渲染文案设置并更新生成参数。"""
     with panel:
@@ -4143,6 +4433,9 @@ def _render_script_settings(panel, params):
                     key="video_subject",
                     label_visibility="collapsed",
                 ).strip()
+
+            _render_trending_topics(params)
+            _render_subject_backlog(params)
 
             video_languages = [
                 (tr("Auto Detect"), ""),
