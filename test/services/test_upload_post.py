@@ -222,3 +222,57 @@ class TestUploadPostServiceDynamicConfig(unittest.TestCase):
             test_app_config["upload_post_enabled"] = False
             self.assertFalse(service.enabled)
             self.assertFalse(service.is_configured())
+
+
+class TestUploadPostScheduling(unittest.TestCase):
+    """scheduled_date turns an immediate publish into a queued job."""
+
+    @patch("app.services.upload_post.config.app", _CONFIG_BASE)
+    @patch("app.services.upload_post.os.path.exists", return_value=True)
+    @patch("builtins.open", new_callable=mock_open, read_data=b"video")
+    @patch("app.services.upload_post.requests.post")
+    def test_scheduled_date_is_sent_and_the_job_id_is_returned(
+        self, mock_post, _open, _exists
+    ):
+        response = MagicMock()
+        # A scheduled request answers 202 with a job id and no success flag.
+        response.json.return_value = {"job_id": "job-42"}
+        response.raise_for_status = MagicMock()
+        mock_post.return_value = response
+
+        result = UploadPostService().upload_video(
+            "/fake/v.mp4", "Title", scheduled_date="2026-09-10T18:00:00Z"
+        )
+
+        data = mock_post.call_args.kwargs["data"]
+        self.assertEqual(_get(data, "scheduled_date"), "2026-09-10T18:00:00Z")
+        self.assertEqual(result["job_id"], "job-42")
+        # The caller needs a truthy signal that the job was accepted.
+        self.assertTrue(result["success"])
+
+    @patch("app.services.upload_post.config.app", _CONFIG_BASE)
+    @patch("app.services.upload_post.os.path.exists", return_value=True)
+    @patch("builtins.open", new_callable=mock_open, read_data=b"video")
+    @patch("app.services.upload_post.requests.post")
+    def test_omitting_scheduled_date_keeps_the_payload_unchanged(
+        self, mock_post, _open, _exists
+    ):
+        mock_post.return_value = _mock_response()
+        UploadPostService().upload_video("/fake/v.mp4", "Title")
+        self.assertFalse(_has_key(mock_post.call_args.kwargs["data"], "scheduled_date"))
+
+    @patch("app.services.upload_post.config.app", _CONFIG_BASE)
+    @patch("app.services.upload_post.requests.get")
+    def test_check_status_queries_by_job_id(self, mock_get):
+        response = MagicMock()
+        response.json.return_value = {"status": "scheduled"}
+        response.raise_for_status = MagicMock()
+        mock_get.return_value = response
+
+        UploadPostService().check_status(job_id="job-42")
+        self.assertEqual(mock_get.call_args.kwargs["params"], {"job_id": "job-42"})
+
+    @patch("app.services.upload_post.config.app", _CONFIG_BASE)
+    def test_check_status_needs_an_identifier(self):
+        result = UploadPostService().check_status()
+        self.assertFalse(result["success"])

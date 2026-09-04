@@ -48,7 +48,16 @@ class UploadPostService:
         platforms: Optional[list] = None,
         privacy_level: str = "PUBLIC_TO_EVERYONE",
         youtube_extra: Optional[dict] = None,
+        scheduled_date: Optional[str] = None,
     ) -> dict:
+        """
+        Publish a video, or queue it for a future time.
+
+        ``scheduled_date`` is ISO-8601 (e.g. ``2026-09-10T18:00:00Z``) and may
+        be up to 365 days ahead. Upload-Post answers a scheduled request with
+        202 and a ``job_id`` instead of publishing straight away; the caller
+        should keep that id to check status or move the slot later.
+        """
         if not self.is_configured():
             logger.warning("Upload-Post is not configured. Skipping cross-post.")
             return {"success": False, "error": "Upload-Post not configured"}
@@ -71,6 +80,9 @@ class UploadPostService:
                     ('title', title[:2200]),
                     ('privacy_level', privacy_level),
                 ]
+
+                if scheduled_date:
+                    data.append(('scheduled_date', scheduled_date))
 
                 for platform in platforms:
                     data.append(('platform[]', platform))
@@ -98,7 +110,16 @@ class UploadPostService:
                 response.raise_for_status()
                 result = response.json()
 
-                if result.get('success'):
+                job_id = result.get('job_id')
+                if scheduled_date and job_id:
+                    # A scheduled request returns 202 with a job id and no
+                    # success flag — it has not published yet, so treat the
+                    # accepted job as the success signal.
+                    logger.info(
+                        f"🗓️ Video scheduled for {scheduled_date}. Job ID: {job_id}"
+                    )
+                    result.setdefault('success', True)
+                elif result.get('success'):
                     logger.info(f"✅ Video cross-posted successfully! Request ID: {result.get('request_id')}")
                 else:
                     logger.warning(f"Cross-post failed: {result.get('message', 'Unknown error')}")
@@ -109,16 +130,22 @@ class UploadPostService:
             logger.error(f"Failed to cross-post video: {str(e)}")
             return {"success": False, "error": str(e)}
 
-    def check_status(self, request_id: str) -> dict:
+    def check_status(
+        self, request_id: Optional[str] = None, job_id: Optional[str] = None
+    ) -> dict:
         """
-        Check the status of an upload request.
+        Check the status of an upload request or a scheduled job.
 
         Args:
-            request_id (str): The request ID from upload
+            request_id (str): The request ID from an immediate upload
+            job_id (str): The job ID returned when scheduled_date was used
 
         Returns:
             dict: Status information
         """
+        if not request_id and not job_id:
+            return {"success": False, "error": "request_id or job_id is required"}
+
         try:
             headers = {
                 'Authorization': f'Apikey {self.api_key}'
@@ -126,7 +153,7 @@ class UploadPostService:
 
             response = requests.get(
                 f"{self.API_BASE}/api/uploadposts/status",
-                params={'request_id': request_id},
+                params={'job_id': job_id} if job_id else {'request_id': request_id},
                 headers=headers,
                 timeout=30
             )
@@ -148,5 +175,12 @@ def cross_post_video(
     title: str,
     platforms: Optional[list] = None,
     youtube_extra: Optional[dict] = None,
+    scheduled_date: Optional[str] = None,
 ) -> dict:
-    return upload_post_service.upload_video(video_path, title, platforms, youtube_extra=youtube_extra)
+    return upload_post_service.upload_video(
+        video_path,
+        title,
+        platforms,
+        youtube_extra=youtube_extra,
+        scheduled_date=scheduled_date,
+    )

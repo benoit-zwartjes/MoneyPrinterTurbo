@@ -1,0 +1,235 @@
+# Automated Reddit recaps
+
+Fetch story posts from Reddit, split them into Shorts-sized parts, render each
+part, hold them for review, then hand the approved ones to Upload-Post with a
+publishing schedule.
+
+Two ways to drive it. The **Reddit Recaps page** in the WebUI does the whole
+thing — find, render, review, schedule — and is the one to use day to day. The
+**CLI scripts** do the same work unattended, for a cron job.
+
+```
+                    fetch → filter → split          (app/services/reddit_pipeline.py)
+                              ↓
+WebUI page ─────────→ background task pool ──┐
+scripts/reddit_recap.py → cli.py --batch-file┘
+                              ↓
+                    review queue              (storage/reddit_recaps.json)
+                              ↓
+                    approve → schedule        (Upload-Post scheduled_date)
+```
+
+Both entry points share `reddit_pipeline`, so they cannot drift apart. The page
+is a new file under `webui/pages/`, not an edit to `Main.py` — that is the file
+upstream changes most, and a new file never conflicts on merge.
+
+## What was added
+
+| Path | Role |
+| --- | --- |
+| `webui/pages/1_Reddit_Recaps.py` | The whole workflow as a page |
+| `app/services/reddit_pipeline.py` | Shared orchestration and the backend switch |
+| `app/services/reddit_apify.py` | Apify actor backend |
+| `app/services/reddit_source.py` | Official Reddit API backend |
+| `app/services/reddit_script.py` | Markdown → narration, jargon, part splitting |
+| `app/services/reddit_queue.py` | Dedup, review queue, upload job tracking |
+| `scripts/reddit_recap.py` | Unattended fetch and render |
+| `scripts/reddit_publish.py` | Unattended review and schedule |
+
+`app/services/upload_post.py` gained one optional `scheduled_date` argument.
+
+## 1. Pick a fetch backend
+
+Two backends return identical posts; everything downstream is unaware of which
+ran. Set `reddit_provider` in `config.toml`, or pick it on the page.
+
+### Apify (default)
+
+Runs [`trudax/reddit-scraper-lite`](https://apify.com/trudax/reddit-scraper-lite).
+No Reddit app to register and no per-client rate limit. Paste the token from
+console.apify.com → Settings → Integrations:
+
+```toml
+reddit_provider = "apify"
+reddit_apify_token = "apify_api_..."
+```
+
+It is **pay-per-result**, so `reddit_fetch_limit` is a cost control as much as a
+size one — it is passed as `maxPostCount`, and `maxItems` is that times the
+number of subreddits. Comments are switched off twice (`skipComments` and
+`maxComments: 0`) since a recap never narrates them and each one would be
+billable.
+
+Two details are load-bearing. `includeMediaLinks` is sent as true because the
+actor only populates `upVotes` when it is — without it every post scores zero
+and fails the minimum-score filter. And subreddits are driven through
+`startUrls` pointing at listing pages rather than the actor's `searches` input,
+so what comes back matches what that URL shows in a browser.
+
+The actor gives no `stickied` or `locked` flag, so a pinned mod post is caught
+by the score and word filters rather than by its flag. `is_self` is inferred
+from an empty body, which is what a link post scrapes as.
+
+### Official Reddit API
+
+Register a **script** app at <https://www.reddit.com/prefs/apps>:
+
+```toml
+reddit_provider = "official"
+reddit_client_id = "..."
+reddit_client_secret = "..."
+reddit_username = "your-reddit-username"
+```
+
+Free, and uses the application-only (`client_credentials`) flow — no account
+password. Capped at ~100 queries a minute per client. The username only builds
+the User-Agent Reddit requires, in the form
+`<platform>:<app id>:<version> (by /u/<username>)`; generic agents are throttled
+hard. The unauthenticated `.json` endpoints are not a fallback: roughly 10
+queries a minute, and datacenter IP ranges are blocked outright.
+
+## 2. Turn off auto-upload
+
+`app/services/task.py` cross-posts at the end of the video stage whenever
+Upload-Post auto-upload is on. That would publish every part the moment it
+renders and make the review queue pointless, so `scripts/reddit_recap.py`
+refuses to run while it is enabled:
+
+```toml
+upload_post_auto_upload = false
+```
+
+Pass `--allow-auto-upload` to override, once you trust the output enough to
+skip review entirely.
+
+## 3. Use the page
+
+Open **Reddit Recaps** in the WebUI sidebar. It carries the whole workflow:
+
+1. **Connection** — pick the backend and paste its credentials.
+2. **Story filters** and **Parts and video** — subreddits, thresholds, part
+   length, voice, aspect ratio, material terms. Changes save as you make them.
+3. **Find stories** — fetches, filters and splits, then shows each candidate
+   with its parts and the full narration script for each. Nothing renders yet;
+   read the scripts before spending render time.
+4. Untick what you do not want and **Render** — parts go to the same background
+   task pool the main page uses, and appear in the review queue as they finish.
+5. **Review** — watch each part, then approve or reject the story.
+6. **Schedule** — pick a first slot and an interval; approved parts are handed
+   to Upload-Post in story order, so part 1 always lands before part 2.
+
+Everything below is the same workflow without a browser, for a cron job.
+
+## 4. Dry run
+
+```bash
+uv run python scripts/reddit_recap.py --dry-run
+```
+
+Fetches, filters and splits without rendering anything, and prints the parts as
+JSON. Read the scripts before spending render time — the normalizer is where
+surprises live.
+
+## 5. Render
+
+```bash
+uv run python scripts/reddit_recap.py --max-posts 3
+```
+
+Every option defaults to a `reddit_*` key under `[app]`; see
+`config.example.toml`. Arguments after `--` are forwarded verbatim to `cli.py`:
+
+```bash
+uv run python scripts/reddit_recap.py --max-posts 2 -- --voice-name en-US-AriaNeural
+```
+
+Rendered parts land in the queue as `rendered`.
+
+## 6. Review and schedule
+
+```bash
+uv run python scripts/reddit_publish.py list
+uv run python scripts/reddit_publish.py approve 1a2b3c
+uv run python scripts/reddit_publish.py schedule --interval-hours 8 --dry-run
+uv run python scripts/reddit_publish.py schedule --interval-hours 8
+```
+
+Parts are scheduled in story order, so part 1 always lands before part 2.
+Upload-Post keeps the calendar — `scheduled_date` accepts ISO-8601 up to 365
+days ahead — so nothing here has to stay running to publish on time.
+
+Check on jobs later:
+
+```bash
+uv run python scripts/reddit_publish.py status --refresh
+```
+
+## 7. Schedule it in Coolify
+
+**Resource → Scheduled Tasks**, running inside the existing container:
+
+| Field | Value |
+| --- | --- |
+| Command | `python scripts/reddit_recap.py --max-posts 3` |
+| Frequency | `0 6 * * *` |
+
+Rendering is ffmpeg-bound, so pick an hour when you are not using the WebUI —
+the two will fight for CPU otherwise.
+
+Leave the publish step manual, or add a second task once you trust the output.
+
+## Part shape
+
+`reddit_part_seconds` is a narration target, not a hard cut. The title (part 1)
+and the follow-on line (every part but the last) are charged against the budget,
+so parts land under the limit rather than over it. Splits only ever happen on
+sentence boundaries; a single sentence longer than the budget becomes its own
+part rather than being cut in half.
+
+Duration is estimated from word count at `reddit_words_per_minute` (150 by
+default). If you raise `voice_rate` above 1.0, raise this too or parts will
+render longer than the target.
+
+Stories needing more than `reddit_max_parts` are skipped by default, rather than
+published stopping mid-plot. Set `reddit_skip_truncated = false` to keep them.
+
+## What the normalizer does
+
+Reddit self-text is markdown with subreddit shorthand in it. Both are handled in
+`app/services/reddit_script.py`:
+
+- markdown stripped — links keep their text, bare URLs are dropped, along with
+  headings, quotes, bullets, emphasis, code and spoiler tags;
+- HTML entities unescaped twice, because Reddit double-escapes some bodies and
+  one pass leaves `&#x200B;` in the text for the voice engine to read out;
+- unterminated lines get a full stop, so bullet lists split into sentences
+  instead of running together;
+- a trailing `EDIT:` or `TL;DR` block is dropped — it usually gives away the
+  ending — but only when it sits in the last 40% of the post, so a story that
+  opens with `UPDATE:` survives;
+- shorthand expanded: `AITA`, `NTA`, `MIL`, `IMO` and friends, plus age and
+  gender tokens, so `(28F)` is read as "28 female" rather than spelled out.
+
+Only the uppercase form is matched, so ordinary words like "so", "op" and "info"
+are left alone. Add your own with `[app.reddit_jargon]` in `config.toml`.
+
+## Tests
+
+```bash
+uv run python -m pytest test/services/test_reddit_*.py \
+  test/services/test_upload_post.py
+```
+
+## Worth knowing
+
+**Reddit's terms** cover how fetched content may be used regardless of which
+backend fetched it, and both YouTube and TikTok have policies on repetitive
+mass-produced uploads. Volume and template-sameness are the practical risk
+factors.
+
+**Attribution.** The permalink is stored on every queued post and goes into the
+YouTube description by default via `reddit_caption_template` and the scheduler.
+
+**Dedup is by post ID**, kept in `storage/reddit_recaps.json` and capped at 1000
+posts, oldest dropped first. Delete that file and the next run will happily
+recap everything again.

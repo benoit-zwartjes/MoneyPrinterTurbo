@@ -429,6 +429,99 @@ upload_post_youtube_privacy_status = "public"
 # Cross-post jobs run in the current process and are not resumed after restart.
 upload_post_max_pending_tasks = 10
 
+# -----------------------------------------------------------------------------
+# Reddit recaps
+# -----------------------------------------------------------------------------
+# Automated story-post recaps, driven by the Reddit Recaps page in the WebUI or
+# by scripts/reddit_recap.py.
+#
+# Two backends fetch the same posts and produce identical results downstream:
+#   "apify"    the trudax/reddit-scraper-lite actor. No Reddit app needed and no
+#              per-client rate limit, but pay-per-result — reddit_fetch_limit is
+#              a cost control as much as a size one.
+#   "official" Reddit's own API. Free, but needs a registered script app, and is
+#              capped at ~100 queries a minute per client.
+reddit_provider = "apify"
+
+# --- apify backend ---
+# Token from https://console.apify.com/settings/integrations
+reddit_apify_token = ""
+# Defaults to trudax/reddit-scraper-lite. Change only to run a different actor
+# with the same input and output shape.
+reddit_apify_actor_id = "oAuCIx3ItNrs2okjQ"
+# How long to wait for one actor run before giving up. Results stay in the Apify
+# dataset either way, so a timeout costs the wait, not the run.
+reddit_apify_timeout_seconds = 300
+
+# --- official backend ---
+# Register a "script" app at https://www.reddit.com/prefs/apps to get the id and
+# secret. The unauthenticated reddit .json endpoints are not an option from a
+# server: they allow roughly 10 queries a minute and datacenter IP ranges are
+# blocked outright.
+reddit_client_id = ""
+reddit_client_secret = ""
+# Only used to build the User-Agent Reddit requires. Generic agents are
+# throttled hard, so this is worth filling in.
+reddit_username = ""
+# Overrides the generated User-Agent entirely. Format Reddit expects:
+# <platform>:<app id>:<version> (by /u/<username>)
+reddit_user_agent = ""
+
+# Which subreddits to pull from, and how.
+reddit_subreddits = ["AmItheAsshole", "tifu", "relationship_advice"]
+reddit_listing = "top"          # top, hot, new or rising
+reddit_time_filter = "day"      # only applies to the top listing
+reddit_fetch_limit = 50         # posts requested per subreddit, max 100
+
+# Which posts are worth making. Link posts, stickied threads and bodies that
+# were removed or deleted are always dropped.
+reddit_max_posts_per_run = 3
+reddit_min_score = 500
+reddit_min_words = 120
+reddit_max_words = 1500
+reddit_allow_nsfw = false
+# Drop a story that needs more parts than reddit_max_parts, rather than
+# publishing one that stops mid-plot.
+reddit_skip_truncated = true
+
+# Part shape. reddit_part_seconds is the narration target per part; the title
+# and the follow-on line are charged against it, so parts land under the limit.
+reddit_part_seconds = 55
+reddit_max_parts = 4
+# Narration speed used to turn a word count into seconds. Raise it if your
+# voice_rate is above 1.0, or parts will render longer than the target.
+reddit_words_per_minute = 150
+
+# Framing added around each part. {index}, {next_index} and {total} are
+# substituted; leave a value empty to drop that line entirely.
+reddit_part_intro = "Part {index}."
+reddit_part_outro = "Part {next_index} is up next — follow so you catch it."
+reddit_final_outro = ""
+
+# Material search terms shared by every part. Story recaps use filler b-roll,
+# so generic calm footage reads better than terms pulled from the story.
+reddit_video_terms = "calm abstract background, slow motion texture, ambient loop"
+
+# Render settings applied to every part. The Reddit Recaps page writes these
+# back when you change them there.
+reddit_video_source = "pexels"
+reddit_video_aspect = "9:16"
+reddit_voice_name = "en-US-AriaNeural-Female"
+reddit_subtitle_enabled = true
+
+# Caption used when scheduling. {title}, {subreddit}, {index} and {total} are
+# substituted.
+reddit_caption_template = "{title} (Part {index}/{total}) #reddit #story"
+
+# Default hours between scheduled slots in scripts/reddit_publish.py.
+reddit_publish_interval_hours = 8
+
+# Extra shorthand expanded before text-to-speech, merged over the built-in map
+# in app/services/reddit_script.py. Matched in the uppercase form only.
+[app.reddit_jargon]
+# AITA = "Am I the asshole"
+# NTA = "Not the asshole"
+
 # =============================================================================
 # Whisper Subtitles / Whisper 字幕
 # =============================================================================
