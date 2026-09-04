@@ -33,6 +33,7 @@ class RedditQueueTestCase(unittest.TestCase):
                     "index": i,
                     "total": parts,
                     "subject": f"A story (Part {i}/{parts})",
+                    "script": "Once upon a time.",
                     "estimated_seconds": 42.0,
                 }
                 for i in range(1, parts + 1)
@@ -226,6 +227,132 @@ class TestLibraryView(RedditQueueTestCase):
         self.assertEqual(counts[reddit_queue.STATUS_SCHEDULED], 1)
         self.assertEqual(counts[reddit_queue.STATUS_RENDERED], 1)
         self.assertEqual(counts[reddit_queue.STATUS_UPLOADED], 0)
+
+
+class TestRejecting(RedditQueueTestCase):
+    def _video(self, task_id="task-1", name="final-1.mp4"):
+        """A render where a real one would be: its own storage/tasks folder."""
+        task_dir = os.path.join(self._temp_dir.name, "tasks", task_id)
+        os.makedirs(task_dir, exist_ok=True)
+        path = os.path.join(task_dir, name)
+        with open(path, "wb") as handle:
+            handle.write(b"video")
+        # The combined video, narration and subtitles sit beside the final cut.
+        with open(os.path.join(task_dir, "combined-1.mp4"), "wb") as handle:
+            handle.write(b"combined")
+        return path
+
+    def test_rejecting_keeps_the_videos_by_default(self):
+        video = self._video()
+        reddit_queue.record_post(
+            self._split("aaa", parts=1),
+            [{"index": 1, "total": 1, "status": reddit_queue.STATUS_RENDERED,
+              "task_id": "task-1", "video_path": video}],
+        )
+
+        self.assertEqual(reddit_queue.reject_post("aaa"), 1)
+        part = reddit_queue.get_post("aaa")["parts"][0]
+        self.assertEqual(part["status"], reddit_queue.STATUS_REJECTED)
+        self.assertEqual(part["video_path"], video)
+        self.assertTrue(os.path.exists(video))
+        self.assertFalse(part["discarded"])
+
+    def test_discarding_deletes_the_video_and_keeps_the_story(self):
+        video = self._video()
+        reddit_queue.record_post(
+            self._split("aaa", parts=1),
+            [{"index": 1, "total": 1, "status": reddit_queue.STATUS_RENDERED,
+              "task_id": "task-1", "video_path": video}],
+        )
+
+        self.assertEqual(reddit_queue.reject_post("aaa", discard_video=True), 1)
+        post = reddit_queue.get_post("aaa")
+        part = post["parts"][0]
+        self.assertEqual(part["status"], reddit_queue.STATUS_REJECTED)
+        self.assertIsNone(part["video_path"])
+        self.assertTrue(part["discarded"])
+        # The whole render folder goes, not just the final cut.
+        self.assertFalse(os.path.exists(os.path.dirname(video)))
+        # The story itself survives — that is the whole point.
+        self.assertEqual(post["title"], "A story")
+        self.assertEqual(post["permalink"], self._split("aaa")["permalink"])
+        self.assertEqual(part["script"], "Once upon a time.")
+
+    def test_discarding_stops_a_part_that_is_still_rendering(self):
+        reddit_queue.record_post(
+            self._split("aaa", parts=2),
+            [
+                {"index": 1, "total": 2, "status": reddit_queue.STATUS_RENDERED,
+                 "video_path": None},
+                {"index": 2, "total": 2, "status": reddit_queue.STATUS_RENDERING,
+                 "task_id": "task-2"},
+            ],
+        )
+
+        self.assertEqual(reddit_queue.reject_post("aaa", discard_video=True), 2)
+        statuses = [p["status"] for p in reddit_queue.get_post("aaa")["parts"]]
+        self.assertEqual(statuses, [reddit_queue.STATUS_REJECTED] * 2)
+        # The render is still running, so the part stays findable for cleanup.
+        self.assertEqual(reddit_queue.discarded_parts()[0]["task_id"], "task-2")
+
+    def test_something_already_published_is_left_alone(self):
+        video = self._video()
+        reddit_queue.record_post(
+            self._split("aaa", parts=2),
+            [
+                {"index": 1, "total": 2, "status": reddit_queue.STATUS_UPLOADED,
+                 "task_id": "task-1", "video_path": video},
+                {"index": 2, "total": 2, "status": reddit_queue.STATUS_RENDERED},
+            ],
+        )
+
+        self.assertEqual(reddit_queue.reject_post("aaa", discard_video=True), 1)
+        parts = reddit_queue.get_post("aaa")["parts"]
+        self.assertEqual(parts[0]["status"], reddit_queue.STATUS_UPLOADED)
+        self.assertTrue(os.path.exists(video))
+
+    def test_files_outside_the_task_directory_are_never_deleted(self):
+        outside_dir = os.path.join(self._temp_dir.name, "not-a-task")
+        os.makedirs(outside_dir, exist_ok=True)
+        outside = os.path.join(outside_dir, "video.mp4")
+        with open(outside, "wb") as handle:
+            handle.write(b"video")
+
+        self.assertFalse(
+            reddit_queue.delete_render_files({"video_path": outside})
+        )
+        self.assertFalse(
+            reddit_queue.delete_render_files({"task_id": "../../not-a-task"})
+        )
+        self.assertTrue(os.path.exists(outside))
+
+    def test_a_render_still_in_flight_keeps_its_folder(self):
+        """ffmpeg is writing in there; the worker clears it once it settles."""
+        video = self._video(task_id="task-2")
+        reddit_queue.record_post(
+            self._split("aaa", parts=1),
+            [{"index": 1, "total": 1, "status": reddit_queue.STATUS_RENDERING,
+              "task_id": "task-2"}],
+        )
+
+        reddit_queue.reject_post("aaa", discard_video=True)
+        self.assertTrue(os.path.exists(os.path.dirname(video)))
+        self.assertEqual(len(reddit_queue.discarded_parts()), 1)
+
+    def test_the_script_is_stored_with_the_part(self):
+        reddit_queue.record_post(self._split("aaa", parts=1), self._rendered(parts=1))
+        self.assertEqual(
+            reddit_queue.get_post("aaa")["parts"][0]["script"], "Once upon a time."
+        )
+
+    def test_a_very_long_script_is_capped(self):
+        split = self._split("aaa", parts=1)
+        split["parts"][0]["script"] = "x" * (reddit_queue.MAX_STORED_SCRIPT_CHARS + 500)
+        reddit_queue.record_post(split, self._rendered(parts=1))
+        self.assertEqual(
+            len(reddit_queue.get_post("aaa")["parts"][0]["script"]),
+            reddit_queue.MAX_STORED_SCRIPT_CHARS,
+        )
 
 
 if __name__ == "__main__":

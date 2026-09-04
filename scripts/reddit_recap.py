@@ -45,7 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Arguments after -- are forwarded verbatim to cli.py, so any "
-            "VideoParams option the CLI accepts can be set for the whole batch."
+            "VideoParams option the CLI accepts can be set for the whole batch. "
+            "The manifest carries the background, its clips and the subtitle "
+            "style from config, and a manifest field beats a forwarded option."
         ),
     )
 
@@ -105,7 +107,37 @@ def resolve_options(args: argparse.Namespace) -> dict:
     )
 
 
-def write_manifest(splits: list[dict], video_terms: str) -> str:
+def manifest_row(part: dict, options: dict) -> dict:
+    """
+    One part as VideoParams overrides for cli.py.
+
+    Built from the same ``build_video_params`` the WebUI submits, so a cron run
+    and a click produce the same video: the same background, the same clip, the
+    same subtitle style.
+    """
+    params = reddit_pipeline.build_video_params(part, options)
+    row = {
+        "video_subject": params.video_subject,
+        "video_script": params.video_script,
+        "video_terms": params.video_terms,
+        "video_source": params.video_source,
+        "font_name": params.font_name,
+        "font_size": params.font_size,
+        "text_fore_color": params.text_fore_color,
+        "stroke_color": params.stroke_color,
+        "stroke_width": params.stroke_width,
+    }
+    if params.video_materials:
+        # Absolute paths: a manifest resolves relative material paths against
+        # its own directory, and the library is nowhere near it.
+        row["video_materials"] = [
+            {"provider": material.provider, "url": material.url}
+            for material in params.video_materials
+        ]
+    return row
+
+
+def write_manifest(splits: list[dict], options: dict) -> str:
     """One JSONL line per part, in the order they should be published."""
     manifest_dir = utils.storage_dir("reddit/manifests", create=True)
     path = os.path.join(manifest_dir, f"{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
@@ -114,15 +146,7 @@ def write_manifest(splits: list[dict], video_terms: str) -> str:
         for split in splits:
             for part in split["parts"]:
                 handle.write(
-                    json.dumps(
-                        {
-                            "video_subject": part["subject"],
-                            "video_script": part["script"],
-                            "video_terms": video_terms,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
+                    json.dumps(manifest_row(part, options), ensure_ascii=False) + "\n"
                 )
     return path
 
@@ -223,7 +247,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    options = resolve_options(args)
+    options = reddit_pipeline.with_gameplay_snapshot(resolve_options(args))
+
+    for issue in reddit_pipeline.background_issues(options):
+        # Rendering would otherwise fail once per part at the materials stage,
+        # after paying for the fetch.
+        logger.error(issue)
+        return 2
+
     splits = reddit_pipeline.discover(options)
     if not splits:
         print(json.dumps({"posts": 0, "parts": 0, "rendered": 0, "failed": 0}))
@@ -252,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    manifest_path = write_manifest(splits, options["video_terms"])
+    manifest_path = write_manifest(splits, options)
     logger.info(f"manifest written: {manifest_path}")
 
     if args.manifest_only:

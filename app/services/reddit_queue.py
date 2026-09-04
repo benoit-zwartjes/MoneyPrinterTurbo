@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -31,6 +32,10 @@ from app.utils import utils
 
 QUEUE_FILE_NAME = "reddit_recaps.json"
 MAX_POSTS = 1000
+# The narration is kept with the part so a story survives its video being
+# discarded. Capped because the queue holds up to 1000 posts and a long recap
+# runs to a few thousand characters per part.
+MAX_STORED_SCRIPT_CHARS = 4000
 
 # A part moves rendering → rendered → approved → scheduled → uploaded, and can
 # drop out to failed or rejected at any point. The WebUI submits renders to the
@@ -94,10 +99,12 @@ def _normalize_part(raw) -> dict | None:
         "task_id": _str_or_none(raw.get("task_id")),
         "video_path": _str_or_none(raw.get("video_path")),
         "subject": str(raw.get("subject", "") or ""),
+        "script": str(raw.get("script", "") or "")[:MAX_STORED_SCRIPT_CHARS],
         "estimated_seconds": raw.get("estimated_seconds"),
         "job_id": _str_or_none(raw.get("job_id")),
         "scheduled_for": _str_or_none(raw.get("scheduled_for")),
         "error": _str_or_none(raw.get("error")),
+        "discarded": bool(raw.get("discarded")),
     }
 
 
@@ -221,6 +228,9 @@ def record_post(split_result: dict, parts: list[dict]) -> bool:
         index = script_part.get("index")
         if index in by_index:
             by_index[index]["subject"] = script_part.get("subject", "")
+            by_index[index]["script"] = str(script_part.get("script", "") or "")[
+                :MAX_STORED_SCRIPT_CHARS
+            ]
             by_index[index]["estimated_seconds"] = script_part.get("estimated_seconds")
             by_index[index]["total"] = script_part.get("total", by_index[index]["total"])
 
@@ -248,6 +258,7 @@ def update_part(post_id: str, index: int, **fields) -> bool:
         "job_id",
         "scheduled_for",
         "error",
+        "discarded",
     }
     with _queue_lock:
         queue = load_queue()
@@ -297,14 +308,19 @@ def approved_parts() -> list[dict]:
     return parts_with_status(STATUS_APPROVED)
 
 
-def set_post_status(post_id: str, status: str, only_from: str | None = None) -> int:
+def set_post_status(post_id: str, status: str, only_from=None) -> int:
     """
     Move every part of one post to ``status``; returns how many changed.
 
-    ``only_from`` guards against re-approving something already scheduled.
+    ``only_from`` is one status or several, and guards against re-approving
+    something already scheduled.
     """
     if status not in PART_STATUSES:
         return 0
+
+    sources = None
+    if only_from is not None:
+        sources = {only_from} if isinstance(only_from, str) else set(only_from)
 
     with _queue_lock:
         queue = load_queue()
@@ -314,7 +330,7 @@ def set_post_status(post_id: str, status: str, only_from: str | None = None) -> 
 
         changed = 0
         for part in post["parts"]:
-            if only_from is not None and part["status"] != only_from:
+            if sources is not None and part["status"] not in sources:
                 continue
             if part["status"] == status:
                 continue
@@ -330,8 +346,107 @@ def approve_post(post_id: str) -> int:
     return set_post_status(post_id, STATUS_APPROVED, only_from=STATUS_RENDERED)
 
 
-def reject_post(post_id: str) -> int:
-    return set_post_status(post_id, STATUS_REJECTED, only_from=STATUS_RENDERED)
+def _task_folder_for(part: dict) -> str | None:
+    """
+    The storage/tasks folder one part rendered into, or None.
+
+    Resolved from the task id when there is one and from the recorded video
+    path otherwise, then checked to be strictly inside the tasks root: the
+    queue is a JSON file on disk, and a hand-edited or corrupted path must
+    never be able to delete something else. Same guard the task manager and
+    the delete-video endpoint use.
+    """
+    tasks_root = os.path.realpath(utils.task_dir())
+
+    task_id = str(part.get("task_id") or "").strip()
+    video_path = str(part.get("video_path") or "").strip()
+    if task_id:
+        candidate = os.path.realpath(os.path.join(tasks_root, task_id))
+    elif video_path:
+        candidate = os.path.realpath(os.path.dirname(video_path))
+    else:
+        return None
+
+    if not candidate.startswith(tasks_root + os.sep):
+        logger.warning(f"refusing to delete outside the task directory: {candidate}")
+        return None
+    return candidate
+
+
+def delete_render_files(part: dict) -> bool:
+    """
+    Remove everything one part's render wrote.
+
+    The whole task folder goes, not just the final mp4: the combined video, the
+    narration and the subtitles sit beside it and are the larger half of what a
+    discarded render costs in disk.
+    """
+    folder = _task_folder_for(part)
+    if not folder or not os.path.isdir(folder):
+        return False
+
+    try:
+        shutil.rmtree(folder)
+    except OSError as exc:
+        logger.warning(f"failed to delete {folder}: {exc}")
+        return False
+
+    logger.info(f"discarded render files: {folder}")
+    return True
+
+
+def reject_post(post_id: str, discard_video: bool = False) -> int:
+    """
+    Reject one story.
+
+    By default only parts waiting for review are rejected, and their files are
+    left alone. With ``discard_video`` the whole story stops: parts still
+    rendering are rejected too, so nothing promotes them into the queue later,
+    and every video already written is deleted. The record itself — title,
+    permalink and the narration of every part — stays, which is the point: the
+    story is kept, the footage is not.
+    """
+    if not discard_video:
+        return set_post_status(post_id, STATUS_REJECTED, only_from=STATUS_RENDERED)
+
+    with _queue_lock:
+        queue = load_queue()
+        post = queue["posts"].get(str(post_id))
+        if not post:
+            return 0
+
+        changed = 0
+        for part in post["parts"]:
+            if part["status"] in (STATUS_UPLOADED, STATUS_REJECTED):
+                # Something already published cannot be un-published by deleting
+                # the local copy, so leave it and its files alone.
+                continue
+            if part["status"] != STATUS_RENDERING:
+                # A render still in flight owns its folder — ffmpeg is writing
+                # into it. The worker deletes that one once the task settles.
+                delete_render_files(part)
+                part["video_path"] = None
+            part["discarded"] = True
+            part["status"] = STATUS_REJECTED
+            changed += 1
+
+        if changed:
+            _save_queue(queue)
+        return changed
+
+
+def discarded_parts() -> list[dict]:
+    """
+    Rejected parts whose render may still be running.
+
+    A part rejected mid-render is left by a worker pass, but the render itself
+    keeps going and writes a file nobody asked for; this is what finds it.
+    """
+    return [
+        part
+        for part in parts_with_status(STATUS_REJECTED)
+        if part.get("discarded") and part.get("task_id")
+    ]
 
 
 def approve_all() -> int:
