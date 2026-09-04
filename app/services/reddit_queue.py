@@ -341,6 +341,49 @@ def approve_all() -> int:
     return approved
 
 
+# What a story is waiting on, least advanced first. A failed part outranks
+# everything so a broken story is never displayed as if it were progressing,
+# and a rejected one ranks last so rejecting a story does not hold up the
+# stage of the parts that did go out.
+_STAGE_ORDER = (
+    STATUS_FAILED,
+    STATUS_RENDERING,
+    STATUS_RENDERED,
+    STATUS_APPROVED,
+    STATUS_SCHEDULED,
+    STATUS_UPLOADED,
+    STATUS_REJECTED,
+)
+
+
+def all_posts(newest_first: bool = True) -> list[dict]:
+    """Every story ever recorded, with its parts. The library view reads this."""
+    posts = list(load_queue()["posts"].values())
+    posts.sort(key=lambda post: post["created_at"], reverse=newest_first)
+    return posts
+
+
+def post_stage(post: dict) -> str:
+    """One label for a whole story: the state its least advanced part is in."""
+    parts = post.get("parts") or []
+    if not parts:
+        return STATUS_FAILED
+    return min(
+        (part["status"] for part in parts),
+        key=lambda status: _STAGE_ORDER.index(status)
+        if status in _STAGE_ORDER
+        else len(_STAGE_ORDER),
+    )
+
+
+def post_counts(post: dict) -> dict:
+    """Parts per status for one story."""
+    counts = {status: 0 for status in PART_STATUSES}
+    for part in post.get("parts") or []:
+        counts[part["status"]] = counts.get(part["status"], 0) + 1
+    return counts
+
+
 def get_post(post_id: str) -> dict | None:
     return load_queue()["posts"].get(str(post_id))
 

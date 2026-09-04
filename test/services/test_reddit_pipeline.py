@@ -279,5 +279,231 @@ class TestSyncRendering(PipelineTestCase):
         )
 
 
+class TestDiscoverReport(PipelineTestCase):
+    def test_counts_explain_an_empty_result(self):
+        # "Nothing found" reads very differently when nothing was fetched than
+        # when 2 posts were fetched and the filters rejected both, so the page
+        # needs the counts, not just the list.
+        with patch.object(
+            reddit_pipeline, "fetch_posts", return_value=[_post("a"), _post("b")]
+        ):
+            report = reddit_pipeline.discover_report(_options(min_score=99_999))
+
+        self.assertEqual(report["fetched"], 2)
+        self.assertEqual(report["matched"], 0)
+        self.assertEqual(report["candidates"], [])
+
+    def test_a_failed_fetch_reports_zero_rather_than_raising(self):
+        with patch.object(reddit_pipeline, "fetch_posts", return_value=[]):
+            report = reddit_pipeline.discover_report(_options())
+        self.assertEqual(report["fetched"], 0)
+        self.assertEqual(report["candidates"], [])
+
+    def test_stories_dropped_while_splitting_are_counted(self):
+        with patch.object(reddit_pipeline, "fetch_posts", return_value=[_post("a")]):
+            report = reddit_pipeline.discover_report(
+                _options(part_seconds=1, max_parts=1, skip_truncated=True)
+            )
+        self.assertEqual(report["matched"], 1)
+        self.assertEqual(report["skipped_truncated"], 1)
+        self.assertEqual(report["candidates"], [])
+
+    def test_discover_returns_the_candidates_of_the_report(self):
+        with patch.object(reddit_pipeline, "fetch_posts", return_value=[_post("a")]):
+            options = _options()
+            self.assertEqual(
+                reddit_pipeline.discover(options),
+                reddit_pipeline.discover_report(options)["candidates"],
+            )
+
+
+class TestSchedulingParts(PipelineTestCase):
+    def _approved(self, video_path):
+        return {
+            "post_id": "aaa",
+            "index": 1,
+            "total": 1,
+            "title": "A story",
+            "subreddit": "x",
+            "permalink": "https://reddit.example/aaa",
+            "video_path": video_path,
+        }
+
+    def _record_approved(self, video_path):
+        reddit_queue.record_post(
+            {
+                "post_id": "aaa", "subreddit": "x", "title": "A story",
+                "permalink": "", "score": 0, "truncated": False,
+                "parts": [{"index": 1, "total": 1}],
+            },
+            [{"index": 1, "total": 1, "status": reddit_queue.STATUS_APPROVED,
+              "video_path": video_path}],
+        )
+
+    def test_a_scheduled_part_records_its_job_and_slot(self):
+        video = os.path.join(self._temp_dir.name, "part1.mp4")
+        open(video, "wb").close()
+        self._record_approved(video)
+
+        outcome = reddit_pipeline.schedule_parts(
+            [self._approved(video)],
+            ["2026-01-01T10:00:00Z"],
+            ["tiktok"],
+            publish=lambda **kwargs: {"success": True, "job_id": "job-1"},
+        )
+
+        self.assertEqual(outcome, {"scheduled": 1, "failed": 0, "errors": []})
+        part = reddit_queue.get_post("aaa")["parts"][0]
+        self.assertEqual(part["status"], reddit_queue.STATUS_SCHEDULED)
+        self.assertEqual(part["job_id"], "job-1")
+        self.assertEqual(part["scheduled_for"], "2026-01-01T10:00:00Z")
+
+    def test_a_missing_video_fails_the_part_instead_of_uploading(self):
+        self._record_approved("/nowhere/part1.mp4")
+        calls = []
+
+        outcome = reddit_pipeline.schedule_parts(
+            [self._approved("/nowhere/part1.mp4")],
+            ["2026-01-01T10:00:00Z"],
+            ["tiktok"],
+            publish=lambda **kwargs: calls.append(kwargs) or {"success": True, "job_id": "x"},
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(outcome["failed"], 1)
+        part = reddit_queue.get_post("aaa")["parts"][0]
+        self.assertEqual(part["status"], reddit_queue.STATUS_FAILED)
+        self.assertIn("video file missing", part["error"])
+
+    def test_an_upload_error_is_kept_on_the_part(self):
+        video = os.path.join(self._temp_dir.name, "part1.mp4")
+        open(video, "wb").close()
+        self._record_approved(video)
+
+        reddit_pipeline.schedule_parts(
+            [self._approved(video)],
+            ["2026-01-01T10:00:00Z"],
+            ["tiktok"],
+            publish=lambda **kwargs: {"success": False, "error": "quota exceeded"},
+        )
+
+        part = reddit_queue.get_post("aaa")["parts"][0]
+        self.assertEqual(part["status"], reddit_queue.STATUS_FAILED)
+        self.assertEqual(part["error"], "quota exceeded")
+
+    def test_progress_is_reported_per_part(self):
+        video = os.path.join(self._temp_dir.name, "part1.mp4")
+        open(video, "wb").close()
+        self._record_approved(video)
+        seen = []
+
+        reddit_pipeline.schedule_parts(
+            [self._approved(video)],
+            ["2026-01-01T10:00:00Z"],
+            ["tiktok"],
+            publish=lambda **kwargs: {"success": True, "job_id": "job-1"},
+            on_part=lambda position, part: seen.append(position),
+        )
+
+        self.assertEqual(seen, [1])
+
+    def test_the_caption_template_drives_the_title(self):
+        with patch.dict(
+            reddit_pipeline.config.app,
+            {"reddit_caption_template": "{title} — part {index} of {total}"},
+            clear=False,
+        ):
+            caption = reddit_pipeline.caption_for(
+                {"title": "A story", "index": 2, "total": 3}
+            )
+        self.assertEqual(caption, "A story — part 2 of 3")
+
+    def test_an_unknown_placeholder_falls_back_to_the_subject(self):
+        with patch.dict(
+            reddit_pipeline.config.app,
+            {"reddit_caption_template": "{nonsense}"},
+            clear=False,
+        ):
+            caption = reddit_pipeline.caption_for({"subject": "A story (Part 1/2)"})
+        self.assertEqual(caption, "A story (Part 1/2)")
+
+
+class TestSyncUploads(PipelineTestCase):
+    def _scheduled(self, job_id="job-1"):
+        reddit_queue.record_post(
+            {
+                "post_id": "aaa", "subreddit": "x", "title": "t",
+                "permalink": "", "score": 0, "truncated": False,
+                "parts": [{"index": 1, "total": 1}],
+            },
+            [{"index": 1, "total": 1, "status": reddit_queue.STATUS_SCHEDULED,
+              "job_id": job_id}],
+        )
+
+    def test_a_published_job_becomes_uploaded(self):
+        self._scheduled()
+        outcome = reddit_pipeline.sync_uploads(
+            check_status=lambda job_id: {"status": "completed"}
+        )
+        self.assertEqual(outcome, {"uploaded": 1, "failed": 0})
+        self.assertEqual(
+            reddit_queue.get_post("aaa")["parts"][0]["status"],
+            reddit_queue.STATUS_UPLOADED,
+        )
+
+    def test_a_failed_job_keeps_its_reason(self):
+        self._scheduled()
+        reddit_pipeline.sync_uploads(
+            check_status=lambda job_id: {"status": "failed", "error": "rejected by tiktok"}
+        )
+        part = reddit_queue.get_post("aaa")["parts"][0]
+        self.assertEqual(part["status"], reddit_queue.STATUS_FAILED)
+        self.assertEqual(part["error"], "rejected by tiktok")
+
+    def test_a_pending_job_is_left_scheduled(self):
+        self._scheduled()
+        outcome = reddit_pipeline.sync_uploads(
+            check_status=lambda job_id: {"status": "pending"}
+        )
+        self.assertEqual(outcome, {"uploaded": 0, "failed": 0})
+        self.assertEqual(
+            reddit_queue.get_post("aaa")["parts"][0]["status"],
+            reddit_queue.STATUS_SCHEDULED,
+        )
+
+    def test_a_poll_that_failed_says_nothing_about_the_job(self):
+        # A network error must never be recorded as a failed publish: the video
+        # may well go out on schedule.
+        self._scheduled()
+        reddit_pipeline.sync_uploads(
+            check_status=lambda job_id: {"success": False, "error": "connection reset"}
+        )
+        self.assertEqual(
+            reddit_queue.get_post("aaa")["parts"][0]["status"],
+            reddit_queue.STATUS_SCHEDULED,
+        )
+
+    def test_a_raising_poll_leaves_the_part_alone(self):
+        self._scheduled()
+
+        def explode(job_id):
+            raise RuntimeError("boom")
+
+        outcome = reddit_pipeline.sync_uploads(check_status=explode)
+        self.assertEqual(outcome, {"uploaded": 0, "failed": 0})
+        self.assertEqual(
+            reddit_queue.get_post("aaa")["parts"][0]["status"],
+            reddit_queue.STATUS_SCHEDULED,
+        )
+
+    def test_a_part_without_a_job_id_is_skipped(self):
+        self._scheduled(job_id=None)
+        polled = []
+        reddit_pipeline.sync_uploads(
+            check_status=lambda job_id: polled.append(job_id) or {}
+        )
+        self.assertEqual(polled, [])
+
+
 if __name__ == "__main__":
     unittest.main()

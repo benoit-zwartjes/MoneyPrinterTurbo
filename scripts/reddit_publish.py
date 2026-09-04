@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from loguru import logger  # noqa: E402
 
 from app.config import config  # noqa: E402
-from app.services import reddit_queue, upload_post  # noqa: E402
+from app.services import reddit_pipeline, reddit_queue, upload_post  # noqa: E402
 
 
 DEFAULT_INTERVAL_HOURS = 8
@@ -38,29 +38,6 @@ MAX_SCHEDULE_DAYS = 365
 
 def _setting(key: str, default=None):
     return config.app.get(f"reddit_{key}", default)
-
-
-def _caption(part: dict) -> str:
-    """
-    Build the post caption.
-
-    The part number belongs in the caption as well as the video: on a feed the
-    viewer decides whether to look for part 1 before they hear anything.
-    """
-    template = str(
-        _setting("caption_template", "{title} (Part {index}/{total}) #reddit #story")
-        or ""
-    )
-    try:
-        return template.format(
-            title=part.get("title", ""),
-            subreddit=part.get("subreddit", ""),
-            index=part.get("index", 1),
-            total=part.get("total", 1),
-        )[:2200]
-    except (KeyError, IndexError):
-        logger.warning("reddit_caption_template has an unknown placeholder")
-        return str(part.get("subject", ""))[:2200]
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -182,72 +159,21 @@ def cmd_schedule(args: argparse.Namespace) -> int:
             print(
                 f"{slot.isoformat().replace('+00:00', 'Z')}  "
                 f"{part['post_id']} part {part['index']}/{part['total']}  "
-                f"{_caption(part)[:70]}"
+                f"{reddit_pipeline.caption_for(part)[:70]}"
             )
         print(f"\n{len(approved)} parts would be scheduled to {', '.join(platforms)}.")
         return 0
 
-    scheduled = 0
-    failed = 0
-    for part, slot in zip(approved, slots):
-        video_path = part.get("video_path")
-        if not video_path or not os.path.exists(video_path):
-            logger.error(
-                f"{part['post_id']} part {part['index']}: video file missing "
-                f"({video_path or 'no path recorded'})"
-            )
-            reddit_queue.update_part(
-                part["post_id"],
-                part["index"],
-                status=reddit_queue.STATUS_FAILED,
-                error="video file missing at schedule time",
-            )
-            failed += 1
-            continue
+    outcome = reddit_pipeline.schedule_parts(
+        approved,
+        [slot.isoformat().replace("+00:00", "Z") for slot in slots],
+        platforms,
+    )
+    for error in outcome["errors"]:
+        logger.error(error)
 
-        iso_slot = slot.isoformat().replace("+00:00", "Z")
-        caption = _caption(part)
-        result = upload_post.cross_post_video(
-            video_path=video_path,
-            title=caption,
-            platforms=platforms,
-            scheduled_date=iso_slot,
-            youtube_extra={
-                "youtube_title": caption[:100],
-                "youtube_description": part.get("permalink", ""),
-                "privacyStatus": upload_post.upload_post_service.youtube_privacy_status,
-            },
-        )
-
-        job_id = result.get("job_id") if isinstance(result, dict) else None
-        if isinstance(result, dict) and result.get("success") and job_id:
-            reddit_queue.update_part(
-                part["post_id"],
-                part["index"],
-                status=reddit_queue.STATUS_SCHEDULED,
-                job_id=str(job_id),
-                scheduled_for=iso_slot,
-                error=None,
-            )
-            scheduled += 1
-            logger.info(
-                f"{part['post_id']} part {part['index']}/{part['total']} → {iso_slot}"
-            )
-        else:
-            error = (
-                result.get("error") or result.get("message") or "unknown upload error"
-                if isinstance(result, dict)
-                else "invalid Upload-Post response"
-            )
-            reddit_queue.update_part(
-                part["post_id"],
-                part["index"],
-                status=reddit_queue.STATUS_FAILED,
-                error=str(error),
-            )
-            failed += 1
-            logger.error(f"{part['post_id']} part {part['index']}: {error}")
-
+    scheduled = outcome["scheduled"]
+    failed = outcome["failed"]
     print(json.dumps({"scheduled": scheduled, "failed": failed}))
     return 1 if failed else 0
 
@@ -258,25 +184,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
 
-    for part in reddit_queue.parts_with_status(reddit_queue.STATUS_SCHEDULED):
-        job_id = part.get("job_id")
-        if not job_id:
-            continue
-        result = upload_post.upload_post_service.check_status(job_id=job_id)
-        state = str(result.get("status", "") or "").lower() if isinstance(result, dict) else ""
-        if state in ("completed", "success", "published"):
-            reddit_queue.update_part(
-                part["post_id"], part["index"], status=reddit_queue.STATUS_UPLOADED
-            )
-            logger.info(f"{part['post_id']} part {part['index']} published")
-        elif state in ("failed", "error"):
-            reddit_queue.update_part(
-                part["post_id"],
-                part["index"],
-                status=reddit_queue.STATUS_FAILED,
-                error=str(result.get("error") or "upload job failed"),
-            )
-            logger.warning(f"{part['post_id']} part {part['index']} failed to publish")
+    reddit_pipeline.sync_uploads()
 
     print(json.dumps(reddit_queue.summary(), ensure_ascii=False, indent=2))
     return 0
