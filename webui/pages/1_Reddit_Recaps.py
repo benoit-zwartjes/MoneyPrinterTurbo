@@ -661,6 +661,9 @@ def _schedule(approved: list[dict], slots: list[datetime], platforms: list[str])
 
 
 def main() -> None:
+    # The sidebar that normally carries page navigation is unreachable on a
+    # phone, so the way back has to live in the page body too.
+    st.page_link("Main.py", label="Back to video generation", icon=":material/arrow_back:")
     st.title("Reddit Recaps")
     st.caption("Find Reddit stories, render them as Shorts-sized parts, review what came out, then schedule the approved ones.")
 

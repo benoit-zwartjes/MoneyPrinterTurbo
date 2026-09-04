@@ -1573,6 +1573,18 @@ def _render_top_bar():
         ):
             _render_task_manager_entry()
 
+            # Streamlit puts multipage navigation in the sidebar, and the
+            # expand control for it lives inside the header this project hides.
+            # On a phone the sidebar starts collapsed, so that navigation is
+            # unreachable. This link sits in the page body instead and works at
+            # any width.
+            st.page_link(
+                "pages/1_Reddit_Recaps.py",
+                label="Reddit Recaps",
+                icon=":material/forum:",
+                width="content",
+            )
+
             st.button(
                 tr("Settings"),
                 key="open_settings_dialog_button",
