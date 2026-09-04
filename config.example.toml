@@ -509,7 +509,8 @@ reddit_video_aspect = "9:16"
 reddit_voice_name = "en-US-AriaNeural-Female"
 reddit_subtitle_enabled = true
 
-# Caption used when scheduling. {title}, {subreddit}, {index} and {total} are
+# Caption used when scheduling, by both the Reddit Recaps page and
+# scripts/reddit_publish.py. {title}, {subreddit}, {index} and {total} are
 # substituted.
 reddit_caption_template = "{title} (Part {index}/{total}) #reddit #story"
 

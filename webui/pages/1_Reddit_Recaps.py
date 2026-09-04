@@ -1,8 +1,15 @@
 """
 Reddit Recaps — the whole pipeline as a page.
 
-Find stories, render them into Shorts-sized parts, review what came out, then
-hand the approved parts to Upload-Post on a schedule.
+Find stories, render them into Shorts-sized parts, review what came out, hand
+the approved parts to Upload-Post on a schedule, and keep a record of every
+story the pipeline has ever touched.
+
+Every long step runs on the server, in a background thread owned by the
+process, and reports through ``app/services/reddit_jobs.py``. This page only
+reads state: nothing that matters lives in ``st.session_state``, so a refresh,
+a dropped websocket or a second tab all show the same thing, and closing the
+browser does not stop the work.
 
 Kept as a separate page rather than folded into Main.py on purpose: Main.py is
 the file upstream changes most, and a new file never conflicts on merge. The
@@ -28,6 +35,7 @@ sys.path.insert(0, root_dir)
 from app.config import config  # noqa: E402
 from app.models.schema import VideoAspect  # noqa: E402
 from app.services import (  # noqa: E402
+    reddit_jobs,
     reddit_pipeline,
     reddit_queue,
     reddit_source,  # noqa: F401  (provider labels + official backend)
@@ -47,6 +55,28 @@ if _style_file.exists():
 
 _VIDEO_SOURCES = ("pexels", "pixabay", "coverr")
 _LISTING_HELP = "top uses the time window below; hot, new and rising ignore it."
+# Only polled while the server actually has work in flight; an idle page falls
+# back to a static render and stops asking.
+_LIVE_REFRESH_SECONDS = "2s"
+
+_STAGE_LABELS = {
+    reddit_queue.STATUS_RENDERING: "Rendering",
+    reddit_queue.STATUS_RENDERED: "Waiting for review",
+    reddit_queue.STATUS_APPROVED: "Approved",
+    reddit_queue.STATUS_SCHEDULED: "Scheduled",
+    reddit_queue.STATUS_UPLOADED: "Published",
+    reddit_queue.STATUS_FAILED: "Failed",
+    reddit_queue.STATUS_REJECTED: "Rejected",
+}
+_STAGE_ICONS = {
+    reddit_queue.STATUS_RENDERING: "⏳",
+    reddit_queue.STATUS_RENDERED: "👀",
+    reddit_queue.STATUS_APPROVED: "✅",
+    reddit_queue.STATUS_SCHEDULED: "🗓️",
+    reddit_queue.STATUS_UPLOADED: "🚀",
+    reddit_queue.STATUS_FAILED: "⚠️",
+    reddit_queue.STATUS_REJECTED: "🗑️",
+}
 
 
 def _set_config(key: str, value) -> None:
@@ -60,6 +90,26 @@ def _set_config(key: str, value) -> None:
     """
     if config.app.get(key) != value:
         config.update_config_nonblocking(config.app, key, value)
+
+
+def _stage_label(status: str) -> str:
+    return f"{_STAGE_ICONS.get(status, '•')} {_STAGE_LABELS.get(status, status)}"
+
+
+def _ago(timestamp) -> str:
+    """A finished-at stamp as something a human reads without doing subtraction."""
+    if not timestamp:
+        return "—"
+    seconds = max(0, int(datetime.now(timezone.utc).timestamp() - float(timestamp)))
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return datetime.fromtimestamp(float(timestamp), timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -162,7 +212,7 @@ def _render_setup() -> bool:
 
 
 # -----------------------------------------------------------------------------
-# Find stories
+# Options
 # -----------------------------------------------------------------------------
 
 
@@ -315,6 +365,15 @@ def _render_options() -> dict:
                 help="Shared by every part. Story recaps use filler b-roll, so generic calm footage reads better than terms from the story.",
                 key="reddit_video_terms_input",
             )
+            caption_template = st.text_input(
+                "Publish caption",
+                value=config.app.get(
+                    "reddit_caption_template",
+                    reddit_pipeline.DEFAULT_CAPTION_TEMPLATE,
+                ),
+                help="Placeholders: {title}, {subreddit}, {index}, {total}.",
+                key="reddit_caption_template_input",
+            )
 
     subreddit_list = [s.strip() for s in subreddits.split(",") if s.strip()]
     for key, value in {
@@ -335,36 +394,170 @@ def _render_options() -> dict:
         "reddit_subtitle_enabled": bool(subtitle_enabled),
         "reddit_voice_name": voice_name,
         "reddit_video_terms": video_terms,
+        "reddit_caption_template": caption_template,
     }.items():
         _set_config(key, value)
 
     return reddit_pipeline.resolve_options()
 
 
-def _render_find(options: dict) -> None:
+# -----------------------------------------------------------------------------
+# What the server is doing right now
+# -----------------------------------------------------------------------------
+
+
+def _work_in_flight() -> bool:
+    return bool(
+        reddit_jobs.is_running(reddit_jobs.JOB_DISCOVER)
+        or reddit_jobs.is_running(reddit_jobs.JOB_SCHEDULE)
+        or reddit_queue.parts_with_status(reddit_queue.STATUS_RENDERING)
+    )
+
+
+def _render_activity(live: bool) -> None:
+    """
+    The single place that says what the server is busy with.
+
+    Shown above the tabs because the work outlives whichever tab started it:
+    a render kicked off under "Find" finishes while the user is reading
+    "All stories".
+    """
+    discover_job = reddit_jobs.get_job(reddit_jobs.JOB_DISCOVER)
+    schedule_job = reddit_jobs.get_job(reddit_jobs.JOB_SCHEDULE)
+    rendering = reddit_queue.parts_with_status(reddit_queue.STATUS_RENDERING)
+
+    busy = False
+
+    if discover_job and discover_job["status"] == reddit_jobs.STATUS_RUNNING:
+        busy = True
+        st.progress(
+            max(discover_job["progress"], 5) / 100,
+            text=f"Finding stories · {discover_job['message'] or 'working'}",
+        )
+
+    if schedule_job and schedule_job["status"] == reddit_jobs.STATUS_RUNNING:
+        busy = True
+        st.progress(
+            max(schedule_job["progress"], 5) / 100,
+            text=f"Scheduling uploads · {schedule_job['message'] or 'working'}",
+        )
+
+    for part in rendering:
+        busy = True
+        task = sm.state.get_task(part["task_id"]) or {}
+        st.progress(
+            min(int(task.get("progress", 0) or 0), 100) / 100,
+            text=(
+                f"Rendering · {part['title'][:60]} "
+                f"part {part['index']}/{part['total']}"
+            ),
+        )
+
+    if not busy:
+        if live:
+            # Everything finished since the last poll: refresh the whole page so
+            # the results appear and this stops polling.
+            st.rerun(scope="app")
+        st.caption(
+            "The server is idle. Anything you start keeps running here even "
+            "if you close this page."
+        )
+
+
+@st.fragment(run_every=_LIVE_REFRESH_SECONDS)
+def _render_activity_live() -> None:
+    _render_activity(live=True)
+
+
+# -----------------------------------------------------------------------------
+# Find stories
+# -----------------------------------------------------------------------------
+
+
+def _render_last_discovery(job: dict | None) -> None:
+    """Why the last run produced what it did, kept visible after it finished."""
+    if not job:
+        st.caption("No search has run yet.")
+        return
+
+    if job["status"] == reddit_jobs.STATUS_RUNNING:
+        st.info("Searching on the server. This keeps running if you leave the page.")
+        return
+
+    if job["status"] == reddit_jobs.STATUS_FAILED:
+        st.error(f"Last search failed {_ago(job['finished_at'])}: {job['error']}")
+        return
+
+    result = job["result"]
+    fetched = int(result.get("fetched", 0) or 0)
+    matched = int(result.get("matched", 0) or 0)
+    candidates = result.get("candidates") or []
+
+    st.caption(
+        f"Last search {_ago(job['finished_at'])} · {fetched} posts fetched · "
+        f"{matched} passed the filters · {len(candidates)} ready to render"
+    )
+
+    if candidates:
+        return
+
+    if result.get("consumed"):
+        st.caption(
+            "Those stories went to render; they are in All stories now. Search "
+            "again for more."
+        )
+        return
+
+    # An empty result is the confusing case, so say which step emptied it.
+    if not fetched:
+        st.warning(
+            "Nothing came back from Reddit. Check the credentials above, the "
+            "subreddit names, and whether the server can reach the network."
+        )
+    elif not matched:
+        st.info(
+            "Posts were fetched but none passed the filters. Lower the minimum "
+            "score or word count, widen the time window, or note that stories "
+            "already in the library are never offered twice."
+        )
+    else:
+        skipped = int(result.get("skipped_truncated", 0) or 0)
+        empty = int(result.get("skipped_empty", 0) or 0)
+        st.info(
+            f"Every matching story was dropped while splitting "
+            f"({skipped} too long for the maximum parts, {empty} with nothing "
+            f"narratable). Raise the maximum parts or turn off 'Skip overlong "
+            f"stories'."
+        )
+
+
+def _render_find(options: dict, ready: bool) -> None:
     st.subheader("Find stories")
 
+    running = reddit_jobs.is_running(reddit_jobs.JOB_DISCOVER)
     col_button, col_note = st.columns([1, 3])
     with col_button:
-        find_clicked = st.button(
-            "Find stories", type="primary", use_container_width=True
-        )
+        if st.button(
+            "Searching…" if running else "Find stories",
+            type="primary",
+            use_container_width=True,
+            disabled=running or not ready,
+            key="reddit_find_button",
+        ):
+            reddit_jobs.start_discovery(options)
+            st.rerun()
     with col_note:
-        st.caption("Fetches the listings, drops anything already made, and splits what is left into parts. Nothing renders yet.")
+        st.caption(
+            "Runs as a background task on the server: it fetches the listings, "
+            "drops anything already in the library, and splits what is left "
+            "into parts. The result is saved, so it is still here after a "
+            "refresh. Nothing renders yet."
+        )
 
-    if find_clicked:
-        with st.spinner("Fetching stories…"):
-            try:
-                st.session_state["reddit_candidates"] = reddit_pipeline.discover(options)
-            except Exception as exc:
-                logger.exception(f"reddit discovery failed: {exc}")
-                st.session_state["reddit_candidates"] = []
-                st.error(f"Fetch failed: {type(exc).__name__}: {exc}")
+    _render_last_discovery(reddit_jobs.get_job(reddit_jobs.JOB_DISCOVER))
 
-    candidates = st.session_state.get("reddit_candidates") or []
+    candidates = reddit_jobs.discovered_candidates()
     if not candidates:
-        if find_clicked:
-            st.info("Nothing matched. Loosen the score or word filters, or widen the time window.")
         return
 
     st.caption(f"{len(candidates)} stories ready. Untick any you do not want.")
@@ -391,12 +584,24 @@ def _render_find(options: dict) -> None:
                 selected.append(split)
 
     st.divider()
-    if st.button(
-        f"Render {len(selected)} stories",
-        type="primary",
-        disabled=not selected,
-    ):
-        _submit_renders(selected, options)
+    col_render, col_discard = st.columns([1, 1])
+    with col_render:
+        if st.button(
+            f"Render {len(selected)} stories",
+            type="primary",
+            disabled=not selected,
+            use_container_width=True,
+            key="reddit_render_button",
+        ):
+            _submit_renders(selected, options)
+    with col_discard:
+        if st.button(
+            "Discard these results",
+            use_container_width=True,
+            key="reddit_discard_button",
+        ):
+            reddit_jobs.clear_candidates()
+            st.rerun()
 
 
 def _submit_renders(splits: list[dict], options: dict) -> None:
@@ -408,7 +613,9 @@ def _submit_renders(splits: list[dict], options: dict) -> None:
         )
 
     result = reddit_pipeline.submit_parts(splits, options, submit)
-    st.session_state["reddit_candidates"] = []
+    # The stories are in the library now; leaving them in the candidate list
+    # would offer to render them a second time.
+    reddit_jobs.clear_candidates()
 
     if result["failed"]:
         st.warning(
@@ -426,10 +633,6 @@ def _submit_renders(splits: list[dict], options: dict) -> None:
 
 
 def _render_review() -> None:
-    # Promote anything whose render finished since the last page run, so the
-    # queue reflects reality without the user knowing tasks exist.
-    reddit_pipeline.sync_rendering(sm.state.get_task)
-
     rendering = reddit_queue.parts_with_status(reddit_queue.STATUS_RENDERING)
     pending = reddit_queue.pending_review()
 
@@ -437,17 +640,15 @@ def _render_review() -> None:
     with header[0]:
         st.subheader("Review")
     with header[1]:
-        if st.button("Refresh", use_container_width=True):
+        if st.button("Refresh", use_container_width=True, key="reddit_review_refresh"):
+            reddit_jobs.refresh_now()
             st.rerun()
 
     if rendering:
-        st.info(f"{len(rendering)} parts still rendering.")
-        for part in rendering:
-            task = sm.state.get_task(part["task_id"]) or {}
-            st.progress(
-                min(int(task.get("progress", 0) or 0), 100),
-                text=f"{part['title'][:60]} · Part {part['index']}/{part['total']}",
-            )
+        st.info(
+            f"{len(rendering)} parts still rendering. They appear here on their "
+            "own — the server promotes them as each render finishes."
+        )
 
     if not pending:
         if not rendering:
@@ -486,7 +687,7 @@ def _render_review() -> None:
                     reddit_queue.reject_post(post_id)
                     st.rerun()
 
-    if len(by_post) > 1 and st.button("Approve all"):
+    if len(by_post) > 1 and st.button("Approve all", key="reddit_approve_all"):
         reddit_queue.approve_all()
         st.rerun()
 
@@ -501,13 +702,22 @@ def _render_schedule() -> None:
 
     approved = reddit_queue.approved_parts()
     scheduled = reddit_queue.parts_with_status(reddit_queue.STATUS_SCHEDULED)
+    job = reddit_jobs.get_job(reddit_jobs.JOB_SCHEDULE)
+    running = bool(job and job["status"] == reddit_jobs.STATUS_RUNNING)
+
+    if job and job["status"] == reddit_jobs.STATUS_FAILED:
+        st.error(f"Last scheduling run failed {_ago(job['finished_at'])}: {job['error']}")
+    elif job and job["status"] == reddit_jobs.STATUS_COMPLETED and job["message"]:
+        st.caption(f"Last scheduling run {_ago(job['finished_at'])}: {job['message']}")
+        for error in (job["result"].get("errors") or [])[:10]:
+            st.warning(error)
 
     if not upload_post.upload_post_service.is_configured():
         st.info("Configure Upload-Post in the main settings dialog to schedule publishing.")
         return
 
     if not approved:
-        st.caption("Approve something above to schedule it.")
+        st.caption("Approve something in Review to schedule it.")
     else:
         col_date, col_time, col_interval = st.columns(3)
         with col_date:
@@ -546,6 +756,7 @@ def _render_schedule() -> None:
                     "When": slot.strftime("%Y-%m-%d %H:%M UTC"),
                     "Story": part["title"][:60],
                     "Part": f"{part['index']}/{part['total']}",
+                    "Caption": reddit_pipeline.caption_for(part)[:70],
                 }
                 for part, slot in zip(approved, slots)
             ],
@@ -556,12 +767,39 @@ def _render_schedule() -> None:
         platforms = list(upload_post.upload_post_service.platforms)
         st.caption(f"Publishing to {', '.join(platforms) or '—'}")
 
-        if st.button("Schedule uploads", type="primary", disabled=not platforms):
-            _schedule(approved, slots, platforms)
+        if st.button(
+            "Scheduling…" if running else "Schedule uploads",
+            type="primary",
+            disabled=running or not platforms,
+            key="reddit_schedule_button",
+        ):
+            # Uploading a video file takes minutes per part, so this cannot run
+            # inside the page script: the browser would sit on a spinner and a
+            # closed tab would abandon it half way through the batch.
+            reddit_jobs.start_scheduling(
+                approved,
+                [
+                    slot.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+                    for slot in slots
+                ],
+                platforms,
+            )
+            st.rerun()
 
     if scheduled:
         st.divider()
-        st.caption(f"{len(scheduled)} parts already scheduled")
+        head = st.columns([3, 1])
+        with head[0]:
+            st.caption(
+                f"{len(scheduled)} parts scheduled. The server checks Upload-Post "
+                "on its own and marks them published when they go out."
+            )
+        with head[1]:
+            if st.button(
+                "Check now", use_container_width=True, key="reddit_check_uploads"
+            ):
+                reddit_jobs.refresh_now()
+                st.rerun()
         st.dataframe(
             [
                 {
@@ -577,87 +815,118 @@ def _render_schedule() -> None:
         )
 
 
-def _caption_for(part: dict) -> str:
-    template = str(
-        config.app.get(
-            "reddit_caption_template", "{title} (Part {index}/{total}) #reddit #story"
+# -----------------------------------------------------------------------------
+# All stories
+# -----------------------------------------------------------------------------
+
+
+def _part_row(part: dict) -> dict:
+    seconds = part.get("estimated_seconds")
+    return {
+        "Part": f"{part['index']}/{part['total']}",
+        "State": _stage_label(part["status"]),
+        "Length": f"{seconds:.0f}s" if isinstance(seconds, (int, float)) else "—",
+        "Scheduled for": part.get("scheduled_for") or "—",
+        "Upload job": part.get("job_id") or "—",
+        "Video": os.path.basename(part.get("video_path") or "") or "—",
+        "Problem": part.get("error") or "",
+    }
+
+
+def _render_library() -> None:
+    header = st.columns([3, 1])
+    with header[0]:
+        st.subheader("All stories")
+    with header[1]:
+        if st.button("Refresh", use_container_width=True, key="reddit_library_refresh"):
+            reddit_jobs.refresh_now()
+            st.rerun()
+
+    posts = reddit_queue.all_posts()
+    if not posts:
+        st.caption(
+            "Nothing yet. Every story the pipeline picks up shows here with what "
+            "happened to it — rendered, reviewed, scheduled and published."
         )
-        or ""
+        return
+
+    options = ["all", *reddit_queue.PART_STATUSES]
+    chosen = st.selectbox(
+        "Show",
+        options=options,
+        format_func=lambda value: "Everything" if value == "all" else _stage_label(value),
+        key="reddit_library_filter",
     )
-    try:
-        return template.format(
-            title=part.get("title", ""),
-            subreddit=part.get("subreddit", ""),
-            index=part.get("index", 1),
-            total=part.get("total", 1),
-        )[:2200]
-    except (KeyError, IndexError):
-        return str(part.get("subject", ""))[:2200]
+    if chosen != "all":
+        posts = [
+            post
+            for post in posts
+            if any(part["status"] == chosen for part in post["parts"])
+        ]
+        if not posts:
+            st.caption("No story is in that state.")
+            return
 
+    st.dataframe(
+        [
+            {
+                "Found": datetime.fromtimestamp(
+                    post["created_at"], timezone.utc
+                ).strftime("%Y-%m-%d %H:%M"),
+                "Story": post["title"][:70],
+                "Subreddit": f"r/{post['subreddit']}",
+                "Score": post["score"],
+                "Parts": len(post["parts"]),
+                "State": _stage_label(reddit_queue.post_stage(post)),
+                "Published": reddit_queue.post_counts(post)[
+                    reddit_queue.STATUS_UPLOADED
+                ],
+            }
+            for post in posts
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
 
-def _schedule(approved: list[dict], slots: list[datetime], platforms: list[str]) -> None:
-    scheduled = 0
-    failed = 0
-    progress = st.progress(0.0)
-
-    for position, (part, slot) in enumerate(zip(approved, slots), start=1):
-        progress.progress(position / max(len(approved), 1))
-
-        video_path = part.get("video_path")
-        if not video_path or not os.path.exists(video_path):
-            reddit_queue.update_part(
-                part["post_id"], part["index"],
-                status=reddit_queue.STATUS_FAILED,
-                error="video file missing at schedule time",
-            )
-            failed += 1
-            continue
-
-        iso_slot = slot.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        caption = _caption_for(part)
-        result = upload_post.cross_post_video(
-            video_path=video_path,
-            title=caption,
-            platforms=platforms,
-            scheduled_date=iso_slot,
-            youtube_extra={
-                "youtube_title": caption[:100],
-                "youtube_description": part.get("permalink", ""),
-                "privacyStatus": upload_post.upload_post_service.youtube_privacy_status,
-            },
+    st.caption("Open a story for its parts, upload jobs and any errors.")
+    for post in posts:
+        counts = reddit_queue.post_counts(post)
+        breakdown = " · ".join(
+            f"{count} {_STAGE_LABELS[status].lower()}"
+            for status, count in counts.items()
+            if count
         )
-
-        job_id = result.get("job_id") if isinstance(result, dict) else None
-        if isinstance(result, dict) and result.get("success") and job_id:
-            reddit_queue.update_part(
-                part["post_id"], part["index"],
-                status=reddit_queue.STATUS_SCHEDULED,
-                job_id=str(job_id),
-                scheduled_for=iso_slot,
-                error=None,
+        with st.expander(
+            f"{_stage_label(reddit_queue.post_stage(post))} — {post['title'][:80]} "
+            f"({breakdown})",
+            expanded=False,
+        ):
+            st.caption(f"r/{post['subreddit']} · {post['permalink']}")
+            st.dataframe(
+                [_part_row(part) for part in post["parts"]],
+                use_container_width=True,
+                hide_index=True,
             )
-            scheduled += 1
-        else:
-            error = "invalid Upload-Post response"
-            if isinstance(result, dict):
-                error = result.get("error") or result.get("message") or error
-            reddit_queue.update_part(
-                part["post_id"], part["index"],
-                status=reddit_queue.STATUS_FAILED,
-                error=str(error),
-            )
-            failed += 1
-
-    if failed:
-        st.warning(
-            f"{scheduled} scheduled, {failed} failed."
-        )
-    else:
-        st.success(f"{scheduled} parts scheduled.")
-    st.rerun()
 
 
 # -----------------------------------------------------------------------------
+
+
+def _render_metrics() -> None:
+    counts = reddit_queue.summary()["parts"]
+    metrics = st.columns(6)
+    for column, (label, status) in zip(
+        metrics,
+        [
+            ("Rendering", reddit_queue.STATUS_RENDERING),
+            ("To review", reddit_queue.STATUS_RENDERED),
+            ("Approved", reddit_queue.STATUS_APPROVED),
+            ("Scheduled", reddit_queue.STATUS_SCHEDULED),
+            ("Published", reddit_queue.STATUS_UPLOADED),
+            ("Failed", reddit_queue.STATUS_FAILED),
+        ],
+    ):
+        column.metric(label, counts.get(status, 0))
 
 
 def main() -> None:
@@ -665,33 +934,43 @@ def main() -> None:
     # phone, so the way back has to live in the page body too.
     st.page_link("Main.py", label="Back to video generation", icon=":material/arrow_back:")
     st.title("Reddit Recaps")
-    st.caption("Find Reddit stories, render them as Shorts-sized parts, review what came out, then schedule the approved ones.")
+    st.caption("Find Reddit stories, render them as Shorts-sized parts, review what came out, schedule the approved ones, and watch the whole thing from the library below.")
+
+    # Starts the process-wide worker that promotes finished renders and
+    # published uploads. Idempotent, so every page load is free, and the thread
+    # outlives the browser session that happened to start it.
+    try:
+        reddit_jobs.ensure_worker()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception(f"could not start the reddit recap worker: {exc}")
+        st.warning(
+            "The background worker could not start, so renders and uploads "
+            "will only advance while this page is open."
+        )
 
     ready = _render_setup()
     options = _render_options()
 
-    summary = reddit_queue.summary()
-    counts = summary["parts"]
-    metrics = st.columns(5)
-    for column, (label, value) in zip(
-        metrics,
-        [
-            ("Rendering", counts.get(reddit_queue.STATUS_RENDERING, 0)),
-            ("To review", counts.get(reddit_queue.STATUS_RENDERED, 0)),
-            ("Approved", counts.get(reddit_queue.STATUS_APPROVED, 0)),
-            ("Scheduled", counts.get(reddit_queue.STATUS_SCHEDULED, 0)),
-            ("Failed", counts.get(reddit_queue.STATUS_FAILED, 0)),
-        ],
-    ):
-        column.metric(label, value)
+    _render_metrics()
+
+    if _work_in_flight():
+        _render_activity_live()
+    else:
+        _render_activity(live=False)
 
     st.divider()
-    if ready:
-        _render_find(options)
-    st.divider()
-    _render_review()
-    st.divider()
-    _render_schedule()
+
+    tab_find, tab_review, tab_schedule, tab_library = st.tabs(
+        ["1 · Find", "2 · Review", "3 · Schedule", "4 · All stories"]
+    )
+    with tab_find:
+        _render_find(options, ready)
+    with tab_review:
+        _render_review()
+    with tab_schedule:
+        _render_schedule()
+    with tab_library:
+        _render_library()
 
 
 main()

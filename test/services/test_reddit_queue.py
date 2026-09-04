@@ -173,5 +173,60 @@ class TestSummary(RedditQueueTestCase):
         self.assertEqual(summary["parts"][reddit_queue.STATUS_RENDERED], 2)
 
 
+class TestLibraryView(RedditQueueTestCase):
+    def _set_created(self, post_id, created_at):
+        """Pin the timestamps: two records written in the same millisecond
+        would otherwise leave the order to chance."""
+        queue = reddit_queue.load_queue()
+        queue["posts"][post_id]["created_at"] = created_at
+        reddit_queue._save_queue(queue)
+
+    def test_all_posts_lists_newest_first(self):
+        reddit_queue.record_post(self._split("aaa"), self._rendered())
+        reddit_queue.record_post(self._split("bbb"), self._rendered())
+        self._set_created("aaa", 1_000.0)
+        self._set_created("bbb", 2_000.0)
+
+        ids = [post["post_id"] for post in reddit_queue.all_posts()]
+        self.assertEqual(ids, ["bbb", "aaa"])
+        self.assertEqual(
+            [post["post_id"] for post in reddit_queue.all_posts(newest_first=False)],
+            ["aaa", "bbb"],
+        )
+
+    def test_stage_is_the_least_advanced_part(self):
+        # Half a story published is still a story waiting on the other half.
+        reddit_queue.record_post(self._split("aaa"), self._rendered())
+        reddit_queue.update_part("aaa", 1, status=reddit_queue.STATUS_UPLOADED)
+
+        post = reddit_queue.get_post("aaa")
+        self.assertEqual(reddit_queue.post_stage(post), reddit_queue.STATUS_RENDERED)
+
+    def test_a_failed_part_surfaces_over_progress(self):
+        reddit_queue.record_post(self._split("aaa"), self._rendered())
+        reddit_queue.update_part("aaa", 1, status=reddit_queue.STATUS_UPLOADED)
+        reddit_queue.update_part("aaa", 2, status=reddit_queue.STATUS_FAILED)
+
+        post = reddit_queue.get_post("aaa")
+        self.assertEqual(reddit_queue.post_stage(post), reddit_queue.STATUS_FAILED)
+
+    def test_a_rejected_part_does_not_hold_back_the_stage(self):
+        reddit_queue.record_post(self._split("aaa"), self._rendered())
+        reddit_queue.update_part("aaa", 1, status=reddit_queue.STATUS_UPLOADED)
+        reddit_queue.update_part("aaa", 2, status=reddit_queue.STATUS_REJECTED)
+
+        post = reddit_queue.get_post("aaa")
+        self.assertEqual(reddit_queue.post_stage(post), reddit_queue.STATUS_UPLOADED)
+
+    def test_counts_are_per_story(self):
+        reddit_queue.record_post(self._split("aaa"), self._rendered())
+        reddit_queue.update_part("aaa", 1, status=reddit_queue.STATUS_SCHEDULED)
+
+        counts = reddit_queue.post_counts(reddit_queue.get_post("aaa"))
+        self.assertEqual(counts[reddit_queue.STATUS_SCHEDULED], 1)
+        self.assertEqual(counts[reddit_queue.STATUS_RENDERED], 1)
+        self.assertEqual(counts[reddit_queue.STATUS_UPLOADED], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

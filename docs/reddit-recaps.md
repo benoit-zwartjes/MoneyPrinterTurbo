@@ -11,17 +11,29 @@ thing — find, render, review, schedule — and is the one to use day to day. T
 ```
                     fetch → filter → split          (app/services/reddit_pipeline.py)
                               ↓
-WebUI page ─────────→ background task pool ──┐
-scripts/reddit_recap.py → cli.py --batch-file┘
+WebUI page → background job ─→ background task pool ──┐
+scripts/reddit_recap.py ─────→ cli.py --batch-file────┘
                               ↓
                     review queue              (storage/reddit_recaps.json)
                               ↓
                     approve → schedule        (Upload-Post scheduled_date)
+                              ↓
+                    recap worker              (promotes renders and uploads)
 ```
 
 Both entry points share `reddit_pipeline`, so they cannot drift apart. The page
 is a new file under `webui/pages/`, not an edit to `Main.py` — that is the file
 upstream changes most, and a new file never conflicts on merge.
+
+Nothing slow runs inside the page script. Finding stories and scheduling
+uploads are handed to `app/services/reddit_jobs.py`, which runs them in daemon
+threads owned by the server process and writes their state to
+`storage/reddit_jobs.json`. The page only reads that file, so a result survives
+a refresh, a dropped websocket, a locked phone or a second tab — and closing
+the browser does not stop the work. The same module runs one **recap worker**
+per process, which promotes finished renders into the review queue and asks
+Upload-Post what became of scheduled parts, so the queue keeps moving with
+nobody watching it.
 
 ## What was added
 
@@ -29,6 +41,7 @@ upstream changes most, and a new file never conflicts on merge.
 | --- | --- |
 | `webui/pages/1_Reddit_Recaps.py` | The whole workflow as a page |
 | `app/services/reddit_pipeline.py` | Shared orchestration and the backend switch |
+| `app/services/reddit_jobs.py` | Background jobs, their persisted state, and the worker |
 | `app/services/reddit_apify.py` | Apify actor backend |
 | `app/services/reddit_source.py` | Official Reddit API backend |
 | `app/services/reddit_script.py` | Markdown → narration, jargon, part splitting |
@@ -104,19 +117,41 @@ skip review entirely.
 
 ## 3. Use the page
 
-Open **Reddit Recaps** in the WebUI sidebar. It carries the whole workflow:
+Open **Reddit Recaps** in the WebUI sidebar. It carries the whole workflow, and
+every step of it runs on the server:
 
 1. **Connection** — pick the backend and paste its credentials.
 2. **Story filters** and **Parts and video** — subreddits, thresholds, part
-   length, voice, aspect ratio, material terms. Changes save as you make them.
-3. **Find stories** — fetches, filters and splits, then shows each candidate
-   with its parts and the full narration script for each. Nothing renders yet;
-   read the scripts before spending render time.
+   length, voice, aspect ratio, material terms, publish caption. Changes save as
+   you make them.
+3. **1 · Find** — starts a background search. The button reads *Searching…*
+   while it runs, the progress bar above the tabs shows what the server is
+   doing, and the result is written to disk: leave the page, come back tomorrow,
+   the candidates are still there. Each candidate shows its parts and the full
+   narration script. Nothing renders yet; read the scripts before spending
+   render time.
+
+   A search that finds nothing says which step emptied it — nothing fetched
+   (credentials, subreddit names, network), nothing past the filters (score and
+   word thresholds, or the story is already in the library), or everything
+   dropped while splitting (too long for the maximum parts).
 4. Untick what you do not want and **Render** — parts go to the same background
-   task pool the main page uses, and appear in the review queue as they finish.
-5. **Review** — watch each part, then approve or reject the story.
-6. **Schedule** — pick a first slot and an interval; approved parts are handed
-   to Upload-Post in story order, so part 1 always lands before part 2.
+   task pool the main page uses, and the worker moves them into the review queue
+   as each render finishes, whether or not the page is open.
+5. **2 · Review** — watch each part, then approve or reject the story.
+6. **3 · Schedule** — pick a first slot and an interval; approved parts are
+   handed to Upload-Post in story order, so part 1 always lands before part 2.
+   The uploads themselves run as a background job, so a batch of large files
+   does not tie the browser to the tab. The worker then polls Upload-Post and
+   marks each part **published** when it goes out.
+7. **4 · All stories** — every story the pipeline has ever picked up, newest
+   first, with what became of it: how many parts rendered, are waiting for
+   review, are approved, scheduled or published, each part's upload job, its
+   slot, and any error. Filter by state to answer "what is stuck" or "what went
+   out".
+
+The counters above the tabs are the same picture in one line: rendering, to
+review, approved, scheduled, published, failed.
 
 Everything below is the same workflow without a browser, for a cron job.
 
@@ -232,4 +267,9 @@ YouTube description by default via `reddit_caption_template` and the scheduler.
 
 **Dedup is by post ID**, kept in `storage/reddit_recaps.json` and capped at 1000
 posts, oldest dropped first. Delete that file and the next run will happily
-recap everything again.
+recap everything again — it is also what the *All stories* tab lists, so
+deleting it wipes the history along with the dedup.
+
+**Job state lives in `storage/reddit_jobs.json`**, one record per job kind. A
+job left `running` by a server restart is marked failed the next time it is
+read, rather than leaving the page waiting on a thread that no longer exists.

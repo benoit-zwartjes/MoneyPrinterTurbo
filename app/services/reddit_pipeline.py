@@ -9,10 +9,17 @@ writes a manifest and shells out to ``cli.py``.
     discover()        fetch → filter → split, skipping anything already made
     submit_parts()    hand parts to a renderer and record them as rendering
     sync_rendering()  promote in-flight parts once their task finishes
+    schedule_parts()  hand approved parts to Upload-Post on a calendar
+    sync_uploads()    promote scheduled parts once Upload-Post has published
+
+The last two used to be written out twice, in the WebUI page and in
+scripts/reddit_publish.py. They live here for the same reason as the rest: one
+copy of the rules for what a part's state means.
 """
 
 from __future__ import annotations
 
+import os
 from uuid import uuid4
 
 from loguru import logger
@@ -20,7 +27,13 @@ from loguru import logger
 from app.config import config
 from app.models import const
 from app.models.schema import VideoParams
-from app.services import reddit_apify, reddit_queue, reddit_script, reddit_source
+from app.services import (
+    reddit_apify,
+    reddit_queue,
+    reddit_script,
+    reddit_source,
+    upload_post,
+)
 
 
 PROVIDER_APIFY = "apify"
@@ -32,6 +45,13 @@ DEFAULT_VIDEO_TERMS = "calm abstract background, slow motion texture, ambient lo
 DEFAULT_VIDEO_SOURCE = "pexels"
 DEFAULT_VIDEO_ASPECT = "9:16"
 DEFAULT_VOICE_NAME = "en-US-AriaNeural-Female"
+DEFAULT_CAPTION_TEMPLATE = "{title} (Part {index}/{total}) #reddit #story"
+
+# Upload-Post reports a scheduled job's outcome as a free-text status. Anything
+# outside these two sets means "not settled yet", including a failed poll: a
+# network blip must never be recorded as a failed publish.
+UPLOAD_DONE_STATES = ("completed", "complete", "success", "succeeded", "published", "uploaded", "done")
+UPLOAD_FAILED_STATES = ("failed", "error", "errored", "cancelled", "canceled")
 
 
 def _setting(key: str, default=None):
@@ -123,17 +143,31 @@ def fetch_posts(options: dict) -> list[dict]:
     )
 
 
-def discover(options: dict) -> list[dict]:
+def discover_report(options: dict) -> dict:
     """
     Fetch, filter and split until ``max_posts`` usable stories are found.
 
-    Returns an empty list rather than raising when the fetch fails: a listing
-    outage should leave a scheduled run doing nothing, not crashing.
+    Returns the candidates alongside what happened to everything else. A run
+    that finds nothing is the common case and the counts are the only way to
+    tell the reasons apart: no posts fetched points at credentials or the
+    network, posts fetched but none matched points at the filters.
+
+    Never raises on a listing outage — a scheduled run should do nothing that
+    day, not crash.
     """
+    report = {
+        "candidates": [],
+        "fetched": 0,
+        "matched": 0,
+        "skipped_empty": 0,
+        "skipped_truncated": 0,
+    }
+
     posts = fetch_posts(options)
+    report["fetched"] = len(posts)
     if not posts:
         logger.warning("no posts returned; check credentials, network or filters")
-        return []
+        return report
 
     candidates = reddit_source.filter_posts(
         posts,
@@ -143,6 +177,7 @@ def discover(options: dict) -> list[dict]:
         allow_nsfw=options["allow_nsfw"],
         exclude_ids=reddit_queue.seen_ids(),
     )
+    report["matched"] = len(candidates)
     logger.info(f"{len(candidates)} of {len(posts)} posts passed the filters")
 
     splits: list[dict] = []
@@ -155,16 +190,24 @@ def discover(options: dict) -> list[dict]:
             max_parts=options["max_parts"],
         )
         if not split["parts"]:
+            report["skipped_empty"] += 1
             logger.info(f"skipping {post['id']}: nothing narratable after cleaning")
             continue
         if split["truncated"] and options["skip_truncated"]:
+            report["skipped_truncated"] += 1
             logger.info(
                 f"skipping {post['id']}: needs more than {options['max_parts']} parts"
             )
             continue
         splits.append(split)
 
-    return splits
+    report["candidates"] = splits
+    return report
+
+
+def discover(options: dict) -> list[dict]:
+    """Just the usable stories; see ``discover_report`` for the counts."""
+    return discover_report(options)["candidates"]
 
 
 def build_video_params(part: dict, options: dict) -> VideoParams:
@@ -284,6 +327,185 @@ def sync_rendering(get_task) -> dict:
             failed += 1
 
     return {"rendered": promoted, "failed": failed}
+
+
+def caption_for(part: dict) -> str:
+    """
+    The caption one part publishes with.
+
+    The part number belongs in the caption as well as in the video: on a feed
+    the viewer decides whether to go looking for part 1 before they hear
+    anything. A template with an unknown placeholder falls back to the part
+    subject rather than blocking the upload.
+    """
+    template = str(_setting("caption_template", DEFAULT_CAPTION_TEMPLATE) or "")
+    try:
+        return template.format(
+            title=part.get("title", ""),
+            subreddit=part.get("subreddit", ""),
+            index=part.get("index", 1),
+            total=part.get("total", 1),
+        )[:2200]
+    except (KeyError, IndexError):
+        logger.warning("reddit_caption_template has an unknown placeholder")
+        return str(part.get("subject", ""))[:2200]
+
+
+def schedule_parts(
+    parts: list[dict],
+    slots: list[str],
+    platforms: list[str] | None = None,
+    publish=None,
+    on_part=None,
+) -> dict:
+    """
+    Hand each approved part to Upload-Post for its slot.
+
+    ``slots`` are ISO-8601 strings so the caller owns the calendar and this
+    stays serialisable — a background job carries them across a thread.
+    ``on_part(position, part)`` reports progress. Every part ends in a stored
+    state: scheduled with its job id, or failed with the reason.
+    """
+    publish = publish or upload_post.cross_post_video
+    platforms = list(
+        platforms
+        if platforms is not None
+        else upload_post.upload_post_service.platforms
+    )
+
+    scheduled = 0
+    failed = 0
+    errors: list[str] = []
+
+    def fail(part: dict, reason: str) -> None:
+        nonlocal failed
+        reddit_queue.update_part(
+            part["post_id"], part["index"],
+            status=reddit_queue.STATUS_FAILED,
+            error=reason,
+        )
+        errors.append(
+            f"{part.get('post_id')} part {part.get('index')}/{part.get('total')}: {reason}"
+        )
+        failed += 1
+
+    for position, (part, slot) in enumerate(zip(parts, slots), start=1):
+        if on_part:
+            on_part(position, part)
+
+        video_path = part.get("video_path")
+        if not video_path or not os.path.exists(video_path):
+            fail(part, "video file missing at schedule time")
+            continue
+
+        caption = caption_for(part)
+        result = publish(
+            video_path=video_path,
+            title=caption,
+            platforms=platforms,
+            scheduled_date=slot,
+            youtube_extra={
+                "youtube_title": caption[:100],
+                "youtube_description": part.get("permalink", ""),
+                "privacyStatus": upload_post.upload_post_service.youtube_privacy_status,
+            },
+        )
+
+        job_id = result.get("job_id") if isinstance(result, dict) else None
+        if isinstance(result, dict) and result.get("success") and job_id:
+            reddit_queue.update_part(
+                part["post_id"], part["index"],
+                status=reddit_queue.STATUS_SCHEDULED,
+                job_id=str(job_id),
+                scheduled_for=slot,
+                error=None,
+            )
+            scheduled += 1
+            logger.info(
+                f"{part['post_id']} part {part['index']}/{part['total']} → {slot}"
+            )
+            continue
+
+        reason = "invalid Upload-Post response"
+        if isinstance(result, dict):
+            reason = str(
+                result.get("error") or result.get("message") or reason
+            )
+        fail(part, reason)
+
+    return {"scheduled": scheduled, "failed": failed, "errors": errors}
+
+
+def upload_job_state(payload) -> str | None:
+    """
+    Read one Upload-Post status response.
+
+    Returns ``uploaded``, ``failed``, or None while the job has not settled.
+    An unreadable response is "not settled": a poll that failed on the network
+    says nothing about the job, and marking the part failed there would strand
+    a video that is about to publish.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    status = str(payload.get("status") or payload.get("state") or "").strip().lower()
+    if status in UPLOAD_DONE_STATES:
+        return reddit_queue.STATUS_UPLOADED
+    if status in UPLOAD_FAILED_STATES:
+        return reddit_queue.STATUS_FAILED
+    return None
+
+
+def sync_uploads(check_status=None) -> dict:
+    """
+    Ask Upload-Post what became of every scheduled part.
+
+    ``check_status(job_id=...)`` defaults to the Upload-Post client. A part
+    with no job id cannot be followed and is left alone rather than failed —
+    it would need re-scheduling by hand either way.
+    """
+    check_status = check_status or (
+        lambda job_id: upload_post.upload_post_service.check_status(job_id=job_id)
+    )
+
+    uploaded = 0
+    failed = 0
+
+    for part in reddit_queue.parts_with_status(reddit_queue.STATUS_SCHEDULED):
+        job_id = part.get("job_id")
+        if not job_id:
+            continue
+
+        try:
+            payload = check_status(job_id=job_id)
+        except Exception as exc:
+            # A poll that raised leaves the part scheduled; the next pass of the
+            # worker asks again.
+            logger.warning(f"upload status poll failed for job {job_id}: {exc}")
+            continue
+
+        state = upload_job_state(payload)
+        if state == reddit_queue.STATUS_UPLOADED:
+            reddit_queue.update_part(
+                part["post_id"], part["index"],
+                status=reddit_queue.STATUS_UPLOADED,
+                error=None,
+            )
+            uploaded += 1
+            logger.info(f"{part['post_id']} part {part['index']} published")
+        elif state == reddit_queue.STATUS_FAILED:
+            error = "upload job failed"
+            if isinstance(payload, dict):
+                error = str(payload.get("error") or payload.get("message") or error)
+            reddit_queue.update_part(
+                part["post_id"], part["index"],
+                status=reddit_queue.STATUS_FAILED,
+                error=error,
+            )
+            failed += 1
+            logger.warning(f"{part['post_id']} part {part['index']}: {error}")
+
+    return {"uploaded": uploaded, "failed": failed}
 
 
 def is_configured(provider: str | None = None) -> bool:
