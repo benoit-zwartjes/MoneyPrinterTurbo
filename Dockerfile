@@ -1,5 +1,5 @@
 # Use an official Python runtime as a parent image
-FROM python:3.11-slim-bullseye
+FROM python:3.11-slim-bookworm
 
 # Set the working directory in the container
 WORKDIR /MoneyPrinterTurbo
@@ -19,12 +19,24 @@ ARG PIP_USE_OFFICIAL=0
 # 导致 git/ffmpeg 未安装时仍生成不可用镜像。这里把“写入软件源”“安装”
 # 和“三次重试”拆成边界清晰的 shell 函数，并用函数返回值决定是否继续。
 # 所有软件源统一使用 HTTPS，避免部分网络环境直接拦截明文 HTTP 请求。
+# 发行代号一律从基础镜像的 /etc/os-release 读取，不再写死在 sources.list 里。
+# bullseye 已于 2026-08-31 结束 LTS 支持，pool 里的 .deb 被移往 archive.debian.org，
+# 而索引仍在，apt-get update 成功但 install 全部 404。升级基础镜像时
+# 忘记同步代号会造成同样难排查的混合源故障。
 RUN set -u; \
+    . /etc/os-release; \
+    debian_codename="${VERSION_CODENAME:-}"; \
+    if [ -z "$debian_codename" ]; then \
+        echo "Cannot determine the Debian codename of the base image" >&2; \
+        exit 1; \
+    fi; \
     write_debian_sources() { \
         main_url="$1"; \
         security_url="$2"; \
-        printf 'deb %s bullseye main\ndeb %s bullseye-updates main\ndeb %s bullseye-security main\n' \
-            "$main_url" "$main_url" "$security_url" > /etc/apt/sources.list; \
+        printf 'deb %s %s main\ndeb %s %s-updates main\ndeb %s %s-security main\n' \
+            "$main_url" "$debian_codename" \
+            "$main_url" "$debian_codename" \
+            "$security_url" "$debian_codename" > /etc/apt/sources.list; \
         rm -rf /var/lib/apt/lists/*; \
     }; \
     install_system_dependencies() { \
