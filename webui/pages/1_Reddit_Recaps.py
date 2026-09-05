@@ -36,6 +36,7 @@ sys.path.insert(0, root_dir)
 from app.config import config  # noqa: E402
 from app.models.schema import VideoAspect  # noqa: E402
 from app.services import (  # noqa: E402
+    gameplay_fetch,
     gameplay_library,
     material_upload,
     reddit_jobs,
@@ -72,8 +73,14 @@ _THICKNESS_LABELS = {
 # Only polled while the server actually has work in flight; an idle page falls
 # back to a static render and stops asking.
 _LIVE_REFRESH_SECONDS = "2s"
+# The backlog is permanent, so it grows without bound on a server that searches
+# on a schedule. Rendering every entry would make the tab unusable long before
+# anyone scrolled that far.
+_BACKLOG_PAGE_SIZE = 50
 
 _STAGE_LABELS = {
+    reddit_queue.STATUS_DISCOVERED: "In the backlog",
+    reddit_queue.STATUS_ARCHIVED: "Archived",
     reddit_queue.STATUS_RENDERING: "Rendering",
     reddit_queue.STATUS_RENDERED: "Waiting for review",
     reddit_queue.STATUS_APPROVED: "Approved",
@@ -83,6 +90,8 @@ _STAGE_LABELS = {
     reddit_queue.STATUS_REJECTED: "Rejected",
 }
 _STAGE_ICONS = {
+    reddit_queue.STATUS_DISCOVERED: "📥",
+    reddit_queue.STATUS_ARCHIVED: "📦",
     reddit_queue.STATUS_RENDERING: "⏳",
     reddit_queue.STATUS_RENDERED: "👀",
     reddit_queue.STATUS_APPROVED: "✅",
@@ -279,6 +288,8 @@ def _render_background_library(background: str) -> None:
             "on the server — they show up here."
         )
 
+        _render_clip_download()
+
         with st.form("reddit_gameplay_upload", clear_on_submit=True):
             uploaded = st.file_uploader(
                 "Add clips",
@@ -300,6 +311,77 @@ def _render_background_library(background: str) -> None:
             if row[2].button("Remove", key=f"gameplay_remove_{clip['name']}"):
                 gameplay_library.remove_clip(clip["name"])
                 st.rerun()
+
+
+def _render_clip_download() -> None:
+    """
+    Fill the library from YouTube, as a background job.
+
+    Twenty clips is around twenty minutes of downloading, which is far past
+    what a page script can hold open — so this only ever starts the job and
+    reads its state back, the same as every other long step on this page.
+    """
+    if not gameplay_fetch.is_available():
+        st.info(gameplay_fetch.unavailable_reason())
+        return
+
+    running = reddit_jobs.is_running(reddit_jobs.JOB_FETCH_CLIPS)
+
+    row = st.columns([2, 1, 1])
+    with row[0]:
+        query = st.text_input(
+            "Search YouTube",
+            value=str(
+                config.app.get("reddit_gameplay_query", gameplay_fetch.DEFAULT_QUERY)
+            ),
+            key="reddit_gameplay_query_input",
+        )
+    with row[1]:
+        count = st.number_input(
+            "How many",
+            min_value=1,
+            max_value=50,
+            step=1,
+            value=int(
+                config.app.get("reddit_gameplay_count", gameplay_fetch.DEFAULT_COUNT)
+            ),
+            key="reddit_gameplay_count_input",
+        )
+    with row[2]:
+        # Lines the button up with the inputs beside it rather than the labels.
+        st.write("")
+        if st.button(
+            "Downloading…" if running else "Download",
+            type="primary",
+            use_container_width=True,
+            disabled=running,
+            key="reddit_gameplay_fetch_button",
+        ):
+            _set_config("reddit_gameplay_query", query)
+            _set_config("reddit_gameplay_count", int(count))
+            reddit_jobs.start_clip_fetch(query, int(count))
+            st.rerun()
+
+    st.caption(
+        f"Downloads about {gameplay_fetch.DEFAULT_SEGMENT_SECONDS} seconds from each "
+        "result — enough footage for any one part, without pulling two-hour "
+        "uploads onto the server. Clips already in the library are skipped, so "
+        "this tops up rather than duplicating. Roughly 90 MB per clip."
+    )
+
+    job = reddit_jobs.get_job(reddit_jobs.JOB_FETCH_CLIPS)
+    if job and job["status"] == reddit_jobs.STATUS_FAILED:
+        st.error(f"Last download failed {_ago(job['finished_at'])}: {job['error']}")
+    elif job and job["status"] == reddit_jobs.STATUS_COMPLETED:
+        result = job["result"]
+        st.caption(
+            f"Last download {_ago(job['finished_at'])} · "
+            f"{result.get('downloaded', 0)} added · "
+            f"{result.get('skipped', 0)} already held · "
+            f"{result.get('failed', 0)} failed"
+        )
+        if result.get("error"):
+            st.info(result["error"])
 
 
 def _add_gameplay_clips(uploaded) -> None:
@@ -571,6 +653,7 @@ def _work_in_flight() -> bool:
     return bool(
         reddit_jobs.is_running(reddit_jobs.JOB_DISCOVER)
         or reddit_jobs.is_running(reddit_jobs.JOB_SCHEDULE)
+        or reddit_jobs.is_running(reddit_jobs.JOB_FETCH_CLIPS)
         or reddit_queue.parts_with_status(reddit_queue.STATUS_RENDERING)
     )
 
@@ -601,6 +684,14 @@ def _render_activity(live: bool) -> None:
         st.progress(
             max(schedule_job["progress"], 5) / 100,
             text=f"Scheduling uploads · {schedule_job['message'] or 'working'}",
+        )
+
+    clips_job = reddit_jobs.get_job(reddit_jobs.JOB_FETCH_CLIPS)
+    if clips_job and clips_job["status"] == reddit_jobs.STATUS_RUNNING:
+        busy = True
+        st.progress(
+            max(clips_job["progress"], 5) / 100,
+            text=f"Downloading gameplay clips · {clips_job['message'] or 'working'}",
         )
 
     for part in rendering:
@@ -652,21 +743,14 @@ def _render_last_discovery(job: dict | None) -> None:
     result = job["result"]
     fetched = int(result.get("fetched", 0) or 0)
     matched = int(result.get("matched", 0) or 0)
-    candidates = result.get("candidates") or []
+    added = int(result.get("added", 0) or 0)
 
     st.caption(
         f"Last search {_ago(job['finished_at'])} · {fetched} posts fetched · "
-        f"{matched} passed the filters · {len(candidates)} ready to render"
+        f"{matched} new and past the filters · {added} added to the backlog"
     )
 
-    if candidates:
-        return
-
-    if result.get("consumed"):
-        st.caption(
-            "Those stories went to render; they are in All stories now. Search "
-            "again for more."
-        )
+    if added:
         return
 
     # An empty result is the confusing case, so say which step emptied it.
@@ -677,9 +761,10 @@ def _render_last_discovery(job: dict | None) -> None:
         )
     elif not matched:
         st.info(
-            "Posts were fetched but none passed the filters. Lower the minimum "
-            "score or word count, widen the time window, or note that stories "
-            "already in the library are never offered twice."
+            "Posts were fetched but none of them were new and past the filters. "
+            "Lower the minimum score or word count, widen the time window, or "
+            "note that a story is only ever offered once — anything already in "
+            "the backlog, the library or the archive is skipped."
         )
     else:
         skipped = int(result.get("skipped_truncated", 0) or 0)
@@ -694,8 +779,6 @@ def _render_last_discovery(job: dict | None) -> None:
 
 def _render_find(options: dict, ready: bool) -> None:
     st.subheader("Find stories")
-
-    background_issues = reddit_pipeline.background_issues(options)
 
     running = reddit_jobs.is_running(reddit_jobs.JOB_DISCOVER)
     col_button, col_note = st.columns([1, 3])
@@ -712,65 +795,43 @@ def _render_find(options: dict, ready: bool) -> None:
     with col_note:
         st.caption(
             "Runs as a background task on the server: it fetches the listings, "
-            "drops anything already in the library, and splits what is left "
-            "into parts. The result is saved, so it is still here after a "
-            "refresh. Nothing renders yet."
+            "drops every story it has seen before, splits what is left into "
+            "parts and files them in the backlog below. Nothing renders yet, "
+            "and a story only ever appears here once."
         )
 
     _render_last_discovery(reddit_jobs.get_job(reddit_jobs.JOB_DISCOVER))
 
-    candidates = reddit_jobs.discovered_candidates()
-    if not candidates:
-        return
-
-    st.caption(f"{len(candidates)} stories ready. Untick any you do not want.")
-
-    selected: list[dict] = []
-    for split in candidates:
-        total_seconds = sum(p["estimated_seconds"] for p in split["parts"])
-        header = (
-            f"r/{split['subreddit']} · {split['score']:,} · "
-            f"{len(split['parts'])} parts · {total_seconds:.0f}s — "
-            f"{split['title'][:80]}"
-        )
-        with st.container(border=True):
-            keep = st.checkbox(header, value=True, key=f"pick_{split['post_id']}")
-            st.caption(split["permalink"])
-            for part in split["parts"]:
-                with st.expander(
-                    f"Part {part['index']}/{part['total']} · "
-                    f"{part['estimated_seconds']:.0f}s",
-                    expanded=False,
-                ):
-                    st.write(part["script"])
-            if keep:
-                selected.append(split)
-
     st.divider()
-    for issue in background_issues:
-        st.warning(issue)
+    _render_backlog(options)
+    _render_archive()
 
-    col_render, col_discard = st.columns([1, 1])
-    with col_render:
-        if st.button(
-            f"Render {len(selected)} stories",
-            type="primary",
-            disabled=not selected or bool(background_issues),
-            use_container_width=True,
-            key="reddit_render_button",
+
+def _story_headline(post: dict) -> str:
+    parts = post.get("parts") or []
+    seconds = sum(
+        part["estimated_seconds"]
+        for part in parts
+        if isinstance(part.get("estimated_seconds"), (int, float))
+    )
+    return (
+        f"r/{post['subreddit']} · {post['score']:,} · {len(parts)} parts · "
+        f"{seconds:.0f}s — {post['title'][:80]}"
+    )
+
+
+def _render_story_scripts(post: dict) -> None:
+    for part in post.get("parts") or []:
+        seconds = part.get("estimated_seconds")
+        length = f" · {seconds:.0f}s" if isinstance(seconds, (int, float)) else ""
+        with st.expander(
+            f"Part {part['index']}/{part['total']}{length}", expanded=False
         ):
-            _submit_renders(selected, options)
-    with col_discard:
-        if st.button(
-            "Discard these results",
-            use_container_width=True,
-            key="reddit_discard_button",
-        ):
-            reddit_jobs.clear_candidates()
-            st.rerun()
+            st.write(part.get("script", ""))
 
 
-def _submit_renders(splits: list[dict], options: dict) -> None:
+def _promote(post_ids: list[str], options: dict) -> None:
+    """Render backlog stories, which is what puts them up for review."""
     def submit(task_id, params, part, split):
         webui_task.submit_generation(
             task_id=task_id,
@@ -778,10 +839,7 @@ def _submit_renders(splits: list[dict], options: dict) -> None:
             capture_logs=not config.ui.get("hide_log", False),
         )
 
-    result = reddit_pipeline.submit_parts(splits, options, submit)
-    # The stories are in the library now; leaving them in the candidate list
-    # would offer to render them a second time.
-    reddit_jobs.clear_candidates()
+    result = reddit_pipeline.promote_posts(post_ids, options, submit)
 
     if result["failed"]:
         st.warning(
@@ -789,8 +847,117 @@ def _submit_renders(splits: list[dict], options: dict) -> None:
             f"{result['failed']} could not start."
         )
     else:
-        st.success(f"{result['submitted']} parts queued for rendering.")
+        st.success(
+            f"{result['posts']} stories promoted, "
+            f"{result['submitted']} parts queued for rendering. "
+            "They move to Review as each render finishes."
+        )
     st.rerun()
+
+
+def _render_backlog(options: dict) -> None:
+    st.markdown("#### Backlog")
+
+    posts = reddit_queue.backlog()
+    if not posts:
+        st.caption(
+            "No story is waiting. Search above — anything found is kept here "
+            "until you promote it to review or archive it."
+        )
+        return
+
+    background_issues = reddit_pipeline.background_issues(options)
+    for issue in background_issues:
+        st.warning(issue)
+
+    shown = posts[:_BACKLOG_PAGE_SIZE]
+    if len(posts) > len(shown):
+        st.caption(
+            f"{len(posts)} stories waiting; showing the {len(shown)} most "
+            "recent. Archive what you do not want to keep the list short."
+        )
+    else:
+        st.caption(
+            f"{len(posts)} stories waiting. Promoting one renders its parts and "
+            "sends them to Review; archiving keeps the text and never offers "
+            "the story again."
+        )
+
+    for post in shown:
+        post_id = post["post_id"]
+        with st.container(border=True):
+            st.markdown(f"**{_story_headline(post)}**")
+            st.caption(f"Found {_ago(post['created_at'])} · {post['permalink']}")
+            _render_story_scripts(post)
+
+            actions = st.columns([1, 1, 3])
+            with actions[0]:
+                if st.button(
+                    "Promote to review",
+                    key=f"promote_{post_id}",
+                    type="primary",
+                    disabled=bool(background_issues),
+                    use_container_width=True,
+                ):
+                    _promote([post_id], options)
+            with actions[1]:
+                if st.button(
+                    "Archive",
+                    key=f"archive_{post_id}",
+                    use_container_width=True,
+                ):
+                    reddit_queue.archive_post(post_id)
+                    st.rerun()
+
+    st.divider()
+    bulk = st.columns([1, 1, 2])
+    with bulk[0]:
+        if st.button(
+            f"Promote all {len(posts)}",
+            key="reddit_promote_all",
+            disabled=bool(background_issues),
+            use_container_width=True,
+        ):
+            # Every waiting story, not just the page on screen: the button says
+            # "all" and rendering is what the user came for.
+            _promote([post["post_id"] for post in posts], options)
+    with bulk[1]:
+        if st.button(
+            f"Archive all {len(posts)}",
+            key="reddit_archive_all",
+            use_container_width=True,
+        ):
+            for post in posts:
+                reddit_queue.archive_post(post["post_id"])
+            st.rerun()
+
+
+def _render_archive() -> None:
+    """
+    Archived stories, with a way back.
+
+    Archiving is one click on a long list, so it cannot be the kind of thing
+    that needs a JSON editor to undo.
+    """
+    archived = reddit_queue.archived_posts()
+    if not archived:
+        return
+
+    with st.expander(f"Archived ({len(archived)})", expanded=False):
+        st.caption(
+            "Set aside and never offered again. The text is kept, so an "
+            "archived story can still be read here or put back."
+        )
+        for post in archived[:_BACKLOG_PAGE_SIZE]:
+            row = st.columns([4, 1])
+            row[0].caption(_story_headline(post))
+            if row[1].button(
+                "Restore",
+                key=f"restore_{post['post_id']}",
+                use_container_width=True,
+            ):
+                reddit_queue.restore_post(post["post_id"])
+                st.rerun()
 
 
 # -----------------------------------------------------------------------------
@@ -1121,10 +1288,11 @@ def _render_library() -> None:
 
 def _render_metrics() -> None:
     counts = reddit_queue.summary()["parts"]
-    metrics = st.columns(6)
+    metrics = st.columns(7)
     for column, (label, status) in zip(
         metrics,
         [
+            ("In backlog", reddit_queue.STATUS_DISCOVERED),
             ("Rendering", reddit_queue.STATUS_RENDERING),
             ("To review", reddit_queue.STATUS_RENDERED),
             ("Approved", reddit_queue.STATUS_APPROVED),

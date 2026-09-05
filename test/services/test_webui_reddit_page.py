@@ -16,7 +16,13 @@ from unittest.mock import patch
 from streamlit.testing.v1 import AppTest
 
 from app.config import config
-from app.services import gameplay_library, material_upload, reddit_jobs, reddit_queue
+from app.services import (
+    gameplay_library,
+    material_upload,
+    reddit_jobs,
+    reddit_queue,
+    webui_task,
+)
 
 
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -90,6 +96,16 @@ def test_find_hands_the_fetch_to_a_background_job():
     assert "reddit_pipeline.discover_report" not in calls
 
 
+def test_downloading_clips_hands_the_work_to_a_background_job():
+    """Twenty clips is twenty minutes; it cannot run in the page script."""
+    tree = ast.parse(PAGE_SOURCE)
+    calls = _calls(_function(tree, "_render_clip_download"))
+
+    assert "reddit_jobs.start_clip_fetch" in calls
+    assert "gameplay_fetch.fill_library" not in calls
+    assert "gameplay_fetch.download_clip" not in calls
+
+
 def test_scheduling_hands_the_uploads_to_a_background_job():
     tree = ast.parse(PAGE_SOURCE)
     calls = _calls(_function(tree, "_render_schedule"))
@@ -116,6 +132,26 @@ def test_results_are_not_kept_in_session_state():
     assert not uses_session_state
 
 
+def _backlog_split() -> dict:
+    return {
+        "post_id": "abc123",
+        "subreddit": "AmItheAsshole",
+        "title": "A findable story",
+        "permalink": "https://reddit.example/abc123",
+        "score": 900,
+        "truncated": False,
+        "parts": [
+            {
+                "index": 1,
+                "total": 1,
+                "estimated_seconds": 50.0,
+                "subject": "A findable story (Part 1/1)",
+                "script": "Once upon a time.",
+            }
+        ],
+    }
+
+
 class TestPageRuns(PageTestCase):
     def test_the_page_renders_with_an_empty_queue(self):
         app = self.run_page()
@@ -132,44 +168,43 @@ class TestPageRuns(PageTestCase):
         start.assert_called_once()
         assert not app.exception
 
-    def test_candidates_from_a_finished_job_survive_a_fresh_page_load(self):
-        reddit_jobs._write_job(
-            reddit_jobs.JOB_DISCOVER,
-            job_id="done",
-            status=reddit_jobs.STATUS_COMPLETED,
-            finished_at=1_000.0,
-            result={
-                "candidates": [
-                    {
-                        "post_id": "abc123",
-                        "subreddit": "AmItheAsshole",
-                        "title": "A findable story",
-                        "permalink": "https://reddit.example/abc123",
-                        "score": 900,
-                        "parts": [
-                            {
-                                "index": 1,
-                                "total": 1,
-                                "estimated_seconds": 50.0,
-                                "subject": "A findable story (Part 1/1)",
-                                "script": "Once upon a time.",
-                            }
-                        ],
-                    }
-                ],
-                "fetched": 20,
-                "matched": 1,
-                "skipped_empty": 0,
-                "skipped_truncated": 0,
-            },
-        )
+    def test_the_backlog_survives_a_fresh_page_load(self):
+        """A found story lives in the queue, so any tab or device shows it."""
+        reddit_queue.record_discovered(_backlog_split())
 
         app = self.run_page()
         assert not app.exception
-        rendered = " ".join(item.value for item in app.markdown) + " ".join(
-            str(item.label) for item in app.checkbox
-        )
+        rendered = " ".join(item.value for item in app.markdown)
         assert "A findable story" in rendered
+
+    def test_a_backlog_story_can_be_promoted_to_review(self):
+        reddit_queue.record_discovered(_backlog_split())
+
+        with patch.dict(config.app, {"reddit_background": "pexels"}, clear=False):
+            app = self.run_page()
+            button = next(b for b in app.button if b.label == "Promote to review")
+            with patch.object(webui_task, "submit_generation") as submit:
+                button.click().run()
+
+        assert not app.exception
+        submit.assert_called_once()
+        post = reddit_queue.get_post("abc123")
+        assert post["parts"][0]["status"] == reddit_queue.STATUS_RENDERING
+        assert reddit_queue.backlog() == []
+
+    def test_a_backlog_story_can_be_archived_and_restored(self):
+        reddit_queue.record_discovered(_backlog_split())
+
+        app = self.run_page()
+        next(b for b in app.button if b.label == "Archive").click().run()
+        assert not app.exception
+        assert reddit_queue.backlog() == []
+        assert [p["post_id"] for p in reddit_queue.archived_posts()] == ["abc123"]
+
+        app = self.run_page()
+        next(b for b in app.button if b.label == "Restore").click().run()
+        assert not app.exception
+        assert [p["post_id"] for p in reddit_queue.backlog()] == ["abc123"]
 
     def test_a_failed_job_is_reported_rather_than_hidden(self):
         reddit_jobs._write_job(

@@ -308,13 +308,212 @@ class TestDiscoverReport(PipelineTestCase):
         self.assertEqual(report["skipped_truncated"], 1)
         self.assertEqual(report["candidates"], [])
 
-    def test_discover_returns_the_candidates_of_the_report(self):
+    def test_every_matching_story_is_filed_even_past_max_posts(self):
+        """
+        max_posts caps what a run renders, not what it remembers.
+
+        Dropping the rest would throw away stories the fetch has already been
+        paid for, and the next run would fetch and split them all over again.
+        """
+        posts = [_post(f"post{i}") for i in range(5)]
+        with patch.object(reddit_pipeline, "fetch_posts", return_value=posts):
+            report = reddit_pipeline.discover_report(_options(max_posts=2))
+
+        self.assertEqual(report["added"], 5)
+        self.assertEqual(len(reddit_queue.backlog()), 5)
+
+    def test_a_second_search_offers_nothing_it_already_found(self):
+        """The point of the backlog: a story is fetched, split and offered once."""
+        posts = [_post("a"), _post("b")]
+        with patch.object(reddit_pipeline, "fetch_posts", return_value=posts):
+            first = reddit_pipeline.discover_report(_options())
+            second = reddit_pipeline.discover_report(_options())
+
+        self.assertEqual(first["added"], 2)
+        self.assertEqual(second["fetched"], 2)
+        self.assertEqual(second["matched"], 0)
+        self.assertEqual(second["added"], 0)
+        self.assertEqual(len(reddit_queue.backlog()), 2)
+
+    def test_an_archived_story_is_never_offered_again(self):
         with patch.object(reddit_pipeline, "fetch_posts", return_value=[_post("a")]):
-            options = _options()
-            self.assertEqual(
-                reddit_pipeline.discover(options),
-                reddit_pipeline.discover_report(options)["candidates"],
-            )
+            reddit_pipeline.discover_report(_options())
+            reddit_queue.archive_post("a")
+            report = reddit_pipeline.discover_report(_options())
+
+        self.assertEqual(report["added"], 0)
+        self.assertEqual(reddit_queue.backlog(), [])
+        self.assertEqual(
+            [post["post_id"] for post in reddit_queue.archived_posts()], ["a"]
+        )
+
+
+class TestBacklog(PipelineTestCase):
+    def _discover(self, *post_ids, **overrides):
+        posts = [_post(post_id) for post_id in post_ids]
+        with patch.object(reddit_pipeline, "fetch_posts", return_value=posts):
+            return reddit_pipeline.discover_report(_options(**overrides))
+
+    def test_discover_takes_the_best_of_the_whole_backlog(self):
+        """
+        A leftover from an earlier run is still made later.
+
+        Taking only this run's results would strand everything past max_posts
+        for ever: those stories are on file, so they are never fetched again.
+        """
+        self._discover("a", "b", "c")
+        with patch.object(reddit_pipeline, "fetch_posts", return_value=[]):
+            splits = reddit_pipeline.discover(_options(max_posts=2))
+
+        self.assertEqual(len(splits), 2)
+        self.assertTrue(all(split["parts"] for split in splits))
+
+    def test_promoting_renders_the_stored_narration(self):
+        """
+        A backlog entry renders from what was stored, not from Reddit.
+
+        By the time a story is promoted the thread may be edited or deleted,
+        so going back for it would be a different video — or none.
+        """
+        self._discover("a")
+        scripts = []
+        result = reddit_pipeline.promote_posts(
+            ["a"],
+            _options(),
+            lambda task_id, params, part, split: scripts.append(params.video_script),
+        )
+
+        self.assertEqual(result["posts"], 1)
+        self.assertTrue(scripts)
+        self.assertTrue(all(script.strip() for script in scripts))
+        self.assertEqual(
+            reddit_queue.get_post("a")["parts"][0]["status"],
+            reddit_queue.STATUS_RENDERING,
+        )
+        self.assertEqual(reddit_queue.backlog(), [])
+
+    def test_promoting_twice_does_not_render_twice(self):
+        self._discover("a")
+        submitted = []
+        submit = lambda task_id, params, part, split: submitted.append(task_id)
+        reddit_pipeline.promote_posts(["a"], _options(), submit)
+        first = len(submitted)
+
+        result = reddit_pipeline.promote_posts(["a"], _options(), submit)
+        self.assertEqual(result["submitted"], 0)
+        self.assertEqual(len(submitted), first)
+
+    def test_promoting_keeps_the_moment_the_story_was_found(self):
+        self._discover("a")
+        found_at = reddit_queue.get_post("a")["created_at"]
+        reddit_pipeline.promote_posts(
+            ["a"], _options(), lambda task_id, params, part, split: None
+        )
+        self.assertEqual(reddit_queue.get_post("a")["created_at"], found_at)
+
+    def test_archiving_leaves_a_rendering_story_alone(self):
+        """Archive reaches into the backlog only; it is not a stop button."""
+        self._discover("a")
+        reddit_pipeline.promote_posts(
+            ["a"], _options(), lambda task_id, params, part, split: None
+        )
+        self.assertEqual(reddit_queue.archive_post("a"), 0)
+        self.assertEqual(
+            reddit_queue.get_post("a")["parts"][0]["status"],
+            reddit_queue.STATUS_RENDERING,
+        )
+
+    def test_archiving_can_be_undone(self):
+        self._discover("a")
+        reddit_queue.archive_post("a")
+        self.assertEqual(reddit_queue.backlog(), [])
+
+        reddit_queue.restore_post("a")
+        self.assertEqual([post["post_id"] for post in reddit_queue.backlog()], ["a"])
+
+
+class TestGameplayBackground(PipelineTestCase):
+    def _clips(self, count=8):
+        return [f"/library/clip{i}.mp4" for i in range(count)]
+
+    def _split(self, post_id="abc123", parts=4):
+        return {
+            "post_id": post_id,
+            "subreddit": "tifu",
+            "title": "A story",
+            "permalink": f"https://reddit.example/{post_id}",
+            "score": 900,
+            "truncated": False,
+            "parts": [
+                {
+                    "index": i,
+                    "total": parts,
+                    "subject": f"A story (Part {i}/{parts})",
+                    "script": "Once upon a time.",
+                    "estimated_seconds": 40.0,
+                }
+                for i in range(1, parts + 1)
+            ],
+        }
+
+    def test_every_part_of_one_story_plays_over_the_same_clip(self):
+        """
+        Parts go out as a set, so the background has to be continuous.
+
+        Keying on the part subject gave part 1 and part 2 different footage,
+        which reads as a different video rather than the next instalment.
+        """
+        split = self._split(parts=4)
+        options = _options(background="gameplay", gameplay_clips=self._clips())
+
+        chosen = {
+            reddit_pipeline.build_video_params(
+                part, options, reddit_pipeline.story_key(split)
+            ).video_materials[0].url
+            for part in split["parts"]
+        }
+        self.assertEqual(len(chosen), 1)
+
+    def test_different_stories_still_spread_across_the_library(self):
+        options = _options(background="gameplay", gameplay_clips=self._clips())
+
+        chosen = {
+            reddit_pipeline.build_video_params(
+                split["parts"][0], options, reddit_pipeline.story_key(split)
+            ).video_materials[0].url
+            for split in (self._split(f"post{i}") for i in range(20))
+        }
+        # Not a distribution test — just that one clip is not doing all the work.
+        self.assertGreater(len(chosen), 1)
+
+    def test_submitting_a_story_gives_all_its_parts_one_clip(self):
+        split = self._split(parts=3)
+        seen = []
+        reddit_pipeline.submit_parts(
+            [split],
+            _options(background="gameplay", gameplay_clips=self._clips()),
+            lambda task_id, params, part, s: seen.append(
+                params.video_materials[0].url
+            ),
+        )
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(len(set(seen)), 1)
+
+    def test_a_story_keeps_its_clip_when_it_is_rendered_again(self):
+        split = self._split()
+        options = _options(background="gameplay", gameplay_clips=self._clips())
+        key = reddit_pipeline.story_key(split)
+
+        first = reddit_pipeline.gameplay_clip_for(split["parts"][0], options, key)
+        second = reddit_pipeline.gameplay_clip_for(split["parts"][2], options, key)
+        self.assertEqual(first, second)
+
+    def test_a_caller_with_no_story_still_gets_a_clip(self):
+        options = _options(background="gameplay", gameplay_clips=self._clips())
+        self.assertIn(
+            reddit_pipeline.gameplay_clip_for({"subject": "Something"}, options),
+            self._clips(),
+        )
 
 
 class TestSchedulingParts(PipelineTestCase):

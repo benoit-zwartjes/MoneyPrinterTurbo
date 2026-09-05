@@ -355,5 +355,75 @@ class TestRejecting(RedditQueueTestCase):
         )
 
 
+class TestBacklog(RedditQueueTestCase):
+    def test_a_discovered_story_is_seen_and_waiting(self):
+        self.assertTrue(reddit_queue.record_discovered(self._split("aaa")))
+
+        self.assertEqual(reddit_queue.seen_ids(), {"aaa"})
+        self.assertEqual([p["post_id"] for p in reddit_queue.backlog()], ["aaa"])
+        self.assertEqual(
+            reddit_queue.post_stage(reddit_queue.get_post("aaa")),
+            reddit_queue.STATUS_DISCOVERED,
+        )
+
+    def test_the_narration_is_kept_so_it_can_render_later(self):
+        reddit_queue.record_discovered(self._split("aaa", parts=2))
+        parts = reddit_queue.get_post("aaa")["parts"]
+        self.assertEqual([part["script"] for part in parts], ["Once upon a time."] * 2)
+        self.assertEqual(parts[0]["subject"], "A story (Part 1/2)")
+
+    def test_a_story_already_on_file_is_left_alone(self):
+        """
+        A later search must not drag a made story back into the backlog.
+
+        The filters exclude seen IDs, so this is the belt to that braces — and
+        it is the difference between "already published" and "waiting to be
+        made" when two searches overlap.
+        """
+        reddit_queue.record_post(self._split("aaa"), self._rendered())
+        self.assertFalse(reddit_queue.record_discovered(self._split("aaa")))
+        self.assertEqual(
+            reddit_queue.get_post("aaa")["parts"][0]["status"],
+            reddit_queue.STATUS_RENDERED,
+        )
+        self.assertEqual(reddit_queue.backlog(), [])
+
+    def test_a_story_with_nothing_narratable_is_not_a_backlog_entry(self):
+        split = self._split("aaa")
+        split["parts"] = []
+        self.assertFalse(reddit_queue.record_discovered(split))
+        self.assertEqual(reddit_queue.seen_ids(), set())
+
+    def test_archiving_moves_a_story_out_of_the_backlog_but_not_off_the_file(self):
+        reddit_queue.record_discovered(self._split("aaa", parts=2))
+        self.assertEqual(reddit_queue.archive_post("aaa"), 2)
+
+        self.assertEqual(reddit_queue.backlog(), [])
+        self.assertEqual([p["post_id"] for p in reddit_queue.archived_posts()], ["aaa"])
+        # Still seen, so it is never fetched or offered again.
+        self.assertEqual(reddit_queue.seen_ids(), {"aaa"})
+
+    def test_restoring_puts_a_story_back(self):
+        reddit_queue.record_discovered(self._split("aaa"))
+        reddit_queue.archive_post("aaa")
+        self.assertEqual(reddit_queue.restore_post("aaa"), 2)
+        self.assertEqual([p["post_id"] for p in reddit_queue.backlog()], ["aaa"])
+
+    def test_archiving_cannot_reach_a_story_that_is_already_being_made(self):
+        reddit_queue.record_post(self._split("aaa"), self._rendered())
+        self.assertEqual(reddit_queue.archive_post("aaa"), 0)
+        self.assertEqual(
+            reddit_queue.get_post("aaa")["parts"][0]["status"],
+            reddit_queue.STATUS_RENDERED,
+        )
+
+    def test_promoting_keeps_the_moment_the_story_was_found(self):
+        reddit_queue.record_discovered(self._split("aaa"))
+        found_at = reddit_queue.get_post("aaa")["created_at"]
+
+        reddit_queue.record_post(self._split("aaa"), self._rendered())
+        self.assertEqual(reddit_queue.get_post("aaa")["created_at"], found_at)
+
+
 if __name__ == "__main__":
     unittest.main()

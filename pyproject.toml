@@ -34,6 +34,10 @@ dependencies = [
     "audioop-lts==0.2.2; python_version >= '3.13'",
     "litellm==1.86.2",
     "google-genai==2.11.0",
+    # Not pinned exactly, unlike everything above: yt-dlp tracks YouTube's
+    # extractors, which break every few weeks, and a pinned version stops
+    # fetching gameplay clips until somebody notices and bumps it.
+    "yt-dlp>=2025.12.22",
 ]
 
 [project.optional-dependencies]

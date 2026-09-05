@@ -1,10 +1,13 @@
 """
 Persistent state for the Reddit recap pipeline.
 
-Three jobs, one file at ``storage/reddit_recaps.json``:
+Four jobs, one file at ``storage/reddit_recaps.json``:
 
-* remember which post IDs have already been made, so a scheduled run never
-  recaps the same thread twice;
+* remember which post IDs have already been seen, so a listing is never paid
+  for, split or offered twice — a story enters this file the moment a search
+  turns it up, not when something renders it;
+* hold the backlog of stories that passed the filters and split cleanly but
+  have not been rendered yet, until they are promoted or archived;
 * hold rendered parts in a review queue until they are approved;
 * track the Upload-Post job for each part once it has been scheduled.
 
@@ -33,14 +36,26 @@ from app.utils import utils
 QUEUE_FILE_NAME = "reddit_recaps.json"
 MAX_POSTS = 1000
 # The narration is kept with the part so a story survives its video being
-# discarded. Capped because the queue holds up to 1000 posts and a long recap
-# runs to a few thousand characters per part.
-MAX_STORED_SCRIPT_CHARS = 4000
+# discarded, and so a backlog entry can be rendered later without fetching the
+# thread again — which makes the cap a correctness limit, not a display one:
+# anything trimmed here is narration the promoted video would lose. The page
+# allows at most 180 seconds and 260 words per minute per part, so no part the
+# splitter can produce reaches 6000 characters. Capped all the same because the
+# queue holds up to 1000 posts and is read back in full on every access.
+MAX_STORED_SCRIPT_CHARS = 8000
 
-# A part moves rendering → rendered → approved → scheduled → uploaded, and can
-# drop out to failed or rejected at any point. The WebUI submits renders to the
-# background pool and so passes through 'rendering'; the CLI runner blocks on
-# cli.py and records parts as 'rendered' directly.
+# A part starts discovered — found, split, nothing rendered — and then moves
+# rendering → rendered → approved → scheduled → uploaded, dropping out to
+# failed or rejected at any point. The WebUI submits renders to the background
+# pool and so passes through 'rendering'; the CLI runner blocks on cli.py and
+# records parts as 'rendered' directly.
+#
+# 'archived' is the other way out of the backlog: a story nobody wants to make.
+# It differs from 'rejected' in what it says about the footage — a rejected
+# part had a video and lost it, an archived one was never rendered — and both
+# keep the record, which is what stops the story being offered again.
+STATUS_DISCOVERED = "discovered"
+STATUS_ARCHIVED = "archived"
 STATUS_RENDERING = "rendering"
 STATUS_RENDERED = "rendered"
 STATUS_APPROVED = "approved"
@@ -50,6 +65,8 @@ STATUS_FAILED = "failed"
 STATUS_REJECTED = "rejected"
 
 PART_STATUSES = (
+    STATUS_DISCOVERED,
+    STATUS_ARCHIVED,
     STATUS_RENDERING,
     STATUS_RENDERED,
     STATUS_APPROVED,
@@ -236,6 +253,58 @@ def record_post(split_result: dict, parts: list[dict]) -> bool:
 
     with _queue_lock:
         queue = load_queue()
+        existing = queue["posts"].get(post_id)
+        queue["posts"][post_id] = {
+            "post_id": post_id,
+            "subreddit": str(split_result.get("subreddit", "") or ""),
+            "title": str(split_result.get("title", "") or ""),
+            "permalink": str(split_result.get("permalink", "") or ""),
+            "score": int(split_result.get("score", 0) or 0),
+            # A story promoted out of the backlog is already on file, and the
+            # moment it was found is the interesting one — it is what "Found"
+            # reads in the library. Overwriting it would make a story that has
+            # been waiting for days look like it turned up seconds ago.
+            "created_at": existing["created_at"] if existing else time.time(),
+            "truncated": bool(split_result.get("truncated")),
+            "parts": sorted(by_index.values(), key=lambda p: p["index"]),
+        }
+        return _save_queue(queue)
+
+
+def record_discovered(split_result: dict) -> bool:
+    """
+    Put a story the search turned up into the backlog, before anything renders.
+
+    This is what makes a story fetched once stay fetched: ``seen_ids`` reads
+    every post in this file, so a story waiting in the backlog — or archived
+    out of it — is filtered out of the next listing instead of being split and
+    offered a second time.
+
+    A post ID already on file is left exactly as it is and False comes back: a
+    story that has been rendered, published, rejected or archived must never be
+    dragged back into the backlog by a later search that happens to see it
+    again. True means a new backlog entry was written.
+    """
+    post_id = str(split_result.get("post_id", "") or "").strip()
+    if not post_id:
+        return False
+
+    entries = []
+    for part in split_result.get("parts") or []:
+        normalized = _normalize_part({**part, "status": STATUS_DISCOVERED})
+        if normalized:
+            entries.append(normalized)
+    # A story with nothing narratable is not a backlog entry; it is a story the
+    # splitter rejected, and recording it would put an un-renderable row in
+    # front of the user for ever.
+    if not entries:
+        return False
+
+    with _queue_lock:
+        queue = load_queue()
+        if post_id in queue["posts"]:
+            return False
+
         queue["posts"][post_id] = {
             "post_id": post_id,
             "subreddit": str(split_result.get("subreddit", "") or ""),
@@ -244,7 +313,7 @@ def record_post(split_result: dict, parts: list[dict]) -> bool:
             "score": int(split_result.get("score", 0) or 0),
             "created_at": time.time(),
             "truncated": bool(split_result.get("truncated")),
-            "parts": sorted(by_index.values(), key=lambda p: p["index"]),
+            "parts": sorted(entries, key=lambda part: part["index"]),
         }
         return _save_queue(queue)
 
@@ -344,6 +413,45 @@ def set_post_status(post_id: str, status: str, only_from=None) -> int:
 
 def approve_post(post_id: str) -> int:
     return set_post_status(post_id, STATUS_APPROVED, only_from=STATUS_RENDERED)
+
+
+def backlog(newest_first: bool = True) -> list[dict]:
+    """
+    Stories that passed the filters and split cleanly, waiting to be promoted.
+
+    Read off the stage rather than off individual parts, so a story part-way
+    into rendering never appears here as if it were still untouched.
+    """
+    return [
+        post for post in all_posts(newest_first) if post_stage(post) == STATUS_DISCOVERED
+    ]
+
+
+def archived_posts(newest_first: bool = True) -> list[dict]:
+    return [
+        post for post in all_posts(newest_first) if post_stage(post) == STATUS_ARCHIVED
+    ]
+
+
+def archive_post(post_id: str) -> int:
+    """
+    Set a backlog story aside without rendering it.
+
+    Only ``discovered`` parts move, so archiving cannot reach into a story that
+    is already rendering, published or under review. The record stays, which is
+    the point: an archived story is never fetched or offered again.
+    """
+    return set_post_status(post_id, STATUS_ARCHIVED, only_from=STATUS_DISCOVERED)
+
+
+def restore_post(post_id: str) -> int:
+    """Put an archived story back in the backlog. Archiving is a one-click
+    action on a long list, so it needs a way back that is not editing JSON."""
+    return set_post_status(post_id, STATUS_DISCOVERED, only_from=STATUS_ARCHIVED)
+
+
+def backlog_ids() -> list[str]:
+    return [post["post_id"] for post in backlog()]
 
 
 def _task_folder_for(part: dict) -> str | None:
@@ -458,15 +566,17 @@ def approve_all() -> int:
 
 # What a story is waiting on, least advanced first. A failed part outranks
 # everything so a broken story is never displayed as if it were progressing,
-# and a rejected one ranks last so rejecting a story does not hold up the
-# stage of the parts that did go out.
+# and archived and rejected rank last so setting a story aside does not hold up
+# the stage of the parts that did go out.
 _STAGE_ORDER = (
     STATUS_FAILED,
+    STATUS_DISCOVERED,
     STATUS_RENDERING,
     STATUS_RENDERED,
     STATUS_APPROVED,
     STATUS_SCHEDULED,
     STATUS_UPLOADED,
+    STATUS_ARCHIVED,
     STATUS_REJECTED,
 )
 

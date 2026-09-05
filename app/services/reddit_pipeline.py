@@ -6,7 +6,10 @@ runner cannot drift apart. They differ only in how a part is rendered: the
 WebUI submits to the in-process task pool and watches task state, while the CLI
 writes a manifest and shells out to ``cli.py``.
 
-    discover()        fetch → filter → split, skipping anything already made
+    discover_report() fetch → filter → split into the backlog, once per story
+    take_backlog()    the best stories waiting, as splits
+    discover()        both of the above: what an unattended run should make
+    promote_posts()   render backlog stories, which puts them up for review
     submit_parts()    hand parts to a renderer and record them as rendering
     sync_rendering()  promote in-flight parts once their task finishes
     purge_discarded() delete what a rejected story's render produced anyway
@@ -178,12 +181,24 @@ def fetch_posts(options: dict) -> list[dict]:
 
 def discover_report(options: dict) -> dict:
     """
-    Fetch, filter and split until ``max_posts`` usable stories are found.
+    Fetch, filter and split every story the listings turn up, into the backlog.
 
-    Returns the candidates alongside what happened to everything else. A run
-    that finds nothing is the common case and the counts are the only way to
-    tell the reasons apart: no posts fetched points at credentials or the
-    network, posts fetched but none matched points at the filters.
+    Each story that passes the filters and splits cleanly is written to the
+    queue as ``discovered`` before it renders. That record is what makes a
+    story fetched once stay fetched: it joins ``seen_ids``, so the next search
+    filters it out instead of paying for it, splitting it and offering it a
+    second time. Nothing here renders — promoting a backlog entry is a separate,
+    deliberate step.
+
+    ``max_posts`` is deliberately not applied: it caps how many stories a run
+    *renders*, and capping discovery too would throw away stories that were
+    already fetched and paid for.
+
+    Returns what happened alongside the newly discovered stories. A run that
+    finds nothing is the common case and the counts are the only way to tell
+    the reasons apart: no posts fetched points at credentials or the network,
+    posts fetched but none matched points at the filters, and everything
+    matched but already known means the backlog already has them.
 
     Never raises on a listing outage — a scheduled run should do nothing that
     day, not crash.
@@ -192,6 +207,7 @@ def discover_report(options: dict) -> dict:
         "candidates": [],
         "fetched": 0,
         "matched": 0,
+        "added": 0,
         "skipped_empty": 0,
         "skipped_truncated": 0,
     }
@@ -215,8 +231,6 @@ def discover_report(options: dict) -> dict:
 
     splits: list[dict] = []
     for post in candidates:
-        if len(splits) >= options["max_posts"]:
-            break
         split = reddit_script.split_post(
             post,
             part_seconds=options["part_seconds"],
@@ -232,15 +246,95 @@ def discover_report(options: dict) -> dict:
                 f"skipping {post['id']}: needs more than {options['max_parts']} parts"
             )
             continue
+        if not reddit_queue.record_discovered(split):
+            # Already on file under another state. Rare — the filter excludes
+            # seen IDs — but two searches can overlap, and the story that is
+            # already rendering wins.
+            continue
         splits.append(split)
 
+    report["added"] = len(splits)
     report["candidates"] = splits
+    logger.info(f"{len(splits)} stories added to the backlog")
     return report
 
 
+def split_from_record(post: dict) -> dict:
+    """
+    Rebuild the split shape from a stored story, so it can render later.
+
+    The whole narration is kept in the queue, which is what lets a backlog
+    entry be promoted days after it was found without going back to Reddit for
+    the thread — by then it may well be edited or deleted.
+    """
+    parts = [
+        {
+            "index": part["index"],
+            "total": part["total"],
+            "subject": part.get("subject", ""),
+            "script": part.get("script", ""),
+            "estimated_seconds": part.get("estimated_seconds"),
+        }
+        for part in post.get("parts") or []
+        if part.get("script")
+    ]
+    return {
+        "post_id": post["post_id"],
+        "subreddit": post.get("subreddit", ""),
+        "title": post.get("title", ""),
+        "permalink": post.get("permalink", ""),
+        "score": post.get("score", 0),
+        "truncated": bool(post.get("truncated")),
+        "parts": parts,
+    }
+
+
+def take_backlog(limit: int) -> list[dict]:
+    """
+    The ``limit`` best stories waiting in the backlog, as splits.
+
+    Ordered by score so an unattended run makes the strongest stories it knows
+    about, whether they were found this run or three runs ago — which is what
+    stops a leftover backlog quietly starving the runner.
+    """
+    posts = sorted(
+        reddit_queue.backlog(), key=lambda post: post.get("score", 0), reverse=True
+    )
+    splits = [split_from_record(post) for post in posts[: max(int(limit), 0)]]
+    return [split for split in splits if split["parts"]]
+
+
 def discover(options: dict) -> list[dict]:
-    """Just the usable stories; see ``discover_report`` for the counts."""
-    return discover_report(options)["candidates"]
+    """
+    What an unattended run should make next: fetch, then take from the backlog.
+
+    Fetching first means a story found today can be made today; taking from the
+    backlog rather than from this run's results means the leftovers of previous
+    runs are made too, instead of sitting on disk for ever because they were
+    never fetched again.
+    """
+    discover_report(options)
+    return take_backlog(options["max_posts"])
+
+
+def promote_posts(post_ids, options: dict, submit) -> dict:
+    """
+    Render stories out of the backlog, which puts them in the review queue.
+
+    ``submit`` is the same renderer ``submit_parts`` takes. Anything not
+    actually waiting in the backlog is skipped, so a double-click on Promote
+    cannot start a second render of a story that is already going.
+    """
+    waiting = {post["post_id"]: post for post in reddit_queue.backlog()}
+    splits = [
+        split_from_record(waiting[post_id])
+        for post_id in post_ids
+        if post_id in waiting
+    ]
+    splits = [split for split in splits if split["parts"]]
+    if not splits:
+        return {"posts": 0, "submitted": 0, "failed": 0}
+    return submit_parts(splits, options, submit)
 
 
 def stroke_width_for(options: dict) -> int:
@@ -251,9 +345,24 @@ def stroke_width_for(options: dict) -> int:
     )
 
 
-def gameplay_clip_for(part: dict, options: dict) -> str:
+def story_key(split: dict) -> str:
+    """
+    What identifies one story when picking its background.
+
+    The post ID, falling back to the title: a manifest row or a hand-built
+    split may not carry the ID, and two parts of the same story still have to
+    agree on something.
+    """
+    return str(split.get("post_id") or split.get("title") or "")
+
+
+def gameplay_clip_for(part: dict, options: dict, key: str = "") -> str:
     """
     The background clip one part plays over.
+
+    Keyed on the story, not the part, so every part of one recap plays over the
+    same footage: parts 1 and 2 go out as one set, and swapping the background
+    between them reads as a different video rather than a continuation.
 
     ``options['gameplay_clips']`` is the library as it looked when the batch
     started, so a clip deleted mid-batch cannot renumber what the remaining
@@ -262,7 +371,11 @@ def gameplay_clip_for(part: dict, options: dict) -> str:
     available = options.get("gameplay_clips")
     if available is None:
         available = gameplay_library.paths()
-    return gameplay_library.choose_clip(list(available), part.get("subject", ""))
+    # Falling back to the part subject keeps a caller that has no story to hand
+    # working; it just spreads per part, the way this used to.
+    return gameplay_library.choose_clip(
+        list(available), key or part.get("subject", "")
+    )
 
 
 def with_gameplay_snapshot(options: dict) -> dict:
@@ -279,7 +392,7 @@ def with_gameplay_snapshot(options: dict) -> dict:
     return {**options, "gameplay_clips": gameplay_library.paths()}
 
 
-def build_video_params(part: dict, options: dict) -> VideoParams:
+def build_video_params(part: dict, options: dict, key: str = "") -> VideoParams:
     """
     One part becomes one video.
 
@@ -295,7 +408,7 @@ def build_video_params(part: dict, options: dict) -> VideoParams:
 
     materials = None
     if gameplay:
-        clip = gameplay_clip_for(part, options)
+        clip = gameplay_clip_for(part, options, key)
         materials = [MaterialInfo(provider="local", url=clip)] if clip else None
 
     return VideoParams(
@@ -333,7 +446,7 @@ def submit_parts(splits: list[dict], options: dict, submit) -> dict:
         parts_meta = []
         for part in split["parts"]:
             task_id = str(uuid4())
-            params = build_video_params(part, options)
+            params = build_video_params(part, options, story_key(split))
             entry = {
                 "index": part["index"],
                 "total": part["total"],

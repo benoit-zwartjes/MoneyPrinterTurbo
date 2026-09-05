@@ -11,6 +11,10 @@ thing — find, render, review, schedule — and is the one to use day to day. T
 ```
                     fetch → filter → split          (app/services/reddit_pipeline.py)
                               ↓
+                    backlog                   (storage/reddit_recaps.json)
+                              ↓
+                    promote (or archive)
+                              ↓
 WebUI page → background job ─→ background task pool ──┐
 scripts/reddit_recap.py ─────→ cli.py --batch-file────┘
                               ↓
@@ -43,10 +47,12 @@ nobody watching it.
 | `app/services/reddit_pipeline.py` | Shared orchestration and the backend switch |
 | `app/services/reddit_jobs.py` | Background jobs, their persisted state, and the worker |
 | `app/services/gameplay_library.py` | The Minecraft parkour clips every render plays over |
+| `app/services/gameplay_fetch.py` | Fills that library from YouTube |
+| `scripts/fetch_gameplay_clips.py` | The same, headless |
 | `app/services/reddit_apify.py` | Apify actor backend |
 | `app/services/reddit_source.py` | Official Reddit API backend |
 | `app/services/reddit_script.py` | Markdown → narration, jargon, part splitting |
-| `app/services/reddit_queue.py` | Dedup, review queue, upload job tracking |
+| `app/services/reddit_queue.py` | Dedup, story backlog, review queue, upload job tracking |
 | `scripts/reddit_recap.py` | Unattended fetch and render |
 | `scripts/reddit_publish.py` | Unattended review and schedule |
 
@@ -125,20 +131,42 @@ every step of it runs on the server:
 2. **Story filters** and **Parts and video** — subreddits, thresholds, part
    length, voice, aspect ratio, material terms, publish caption. Changes save as
    you make them.
+
+   **Gameplay clips** is where the background footage lives, and a gameplay
+   background is the default, so an empty library renders nothing. **Download**
+   searches YouTube and fills it — twenty clips takes around twenty minutes and
+   1.8 GB, runs as a background job like everything else here, and skips
+   anything already in the library so it tops up rather than duplicating.
+   Uploading and dropping files into the folder still work.
 3. **1 · Find** — starts a background search. The button reads *Searching…*
-   while it runs, the progress bar above the tabs shows what the server is
-   doing, and the result is written to disk: leave the page, come back tomorrow,
-   the candidates are still there. Each candidate shows its parts and the full
-   narration script. Nothing renders yet; read the scripts before spending
-   render time.
+   while it runs, and the progress bar above the tabs shows what the server is
+   doing. Every story that passes the filters and splits cleanly is written
+   straight into the **backlog** below, so leave the page, come back tomorrow,
+   and it is all still there. Nothing renders yet.
 
    A search that finds nothing says which step emptied it — nothing fetched
-   (credentials, subreddit names, network), nothing past the filters (score and
-   word thresholds, or the story is already in the library), or everything
+   (credentials, subreddit names, network), nothing new past the filters (score
+   and word thresholds, or every story was already found once), or everything
    dropped while splitting (too long for the maximum parts).
-4. Untick what you do not want and **Render** — parts go to the same background
-   task pool the main page uses, and the worker moves them into the review queue
-   as each render finishes, whether or not the page is open.
+4. **The backlog** — every story waiting, newest first, each with its parts and
+   the full narration script. Read the scripts before spending render time, then
+   per story:
+
+   * **Promote to review** renders its parts on the same background task pool
+     the main page uses. The worker moves them into the review queue as each
+     render finishes, whether or not the page is open.
+   * **Archive** sets the story aside without rendering it. The text is kept and
+     the story is never offered again; **Restore** in the *Archived* expander
+     puts it back.
+
+   *Promote all* and *Archive all* do the same to everything waiting, not just
+   the page on screen.
+
+   A story is only ever offered once. It enters this file the moment a search
+   turns it up, and `seen_ids` covers the backlog, the archive and everything
+   already made — so the next search filters it out rather than paying to fetch
+   it, splitting it and showing it again. `reddit_max_posts_per_run` caps what
+   an unattended run *renders*, not what a search remembers.
 5. **2 · Review** — watch each part, then approve or reject the story. A story
    still rendering can be **stopped** from here. See *Rejecting* below for what
    rejecting keeps and what it deletes.
@@ -153,12 +181,39 @@ every step of it runs on the server:
    slot, and any error. Filter by state to answer "what is stuck" or "what went
    out".
 
-The counters above the tabs are the same picture in one line: rendering, to
-review, approved, scheduled, published, failed.
+The counters above the tabs are the same picture in one line: in backlog,
+rendering, to review, approved, scheduled, published, failed.
 
 Everything below is the same workflow without a browser, for a cron job.
 
-## 4. Dry run
+## 4. Gameplay backgrounds
+
+```bash
+uv run python scripts/fetch_gameplay_clips.py
+uv run python scripts/fetch_gameplay_clips.py --count 30 --query "Subway Surfers gameplay no copyright"
+uv run python scripts/fetch_gameplay_clips.py --list
+```
+
+Only a segment of each result is downloaded — two minutes at 1080p, skipping
+the first minute where these uploads put their intro. `combine_videos` walks a
+source in five-second chunks, so two minutes is two dozen distinct shots,
+already more than a one-minute part can show; taking the whole video would mean
+two-hour 4K files that moviepy then has to open. H.264 is preferred over
+YouTube's default AV1, which decodes several times slower and which some ffmpeg
+builds cannot read at all. Reckon on about 90 MB a clip.
+
+1080p rather than 720p because the render crops to fill a 9:16 frame: a 16:9
+source loses its sides, and a 1280x720 clip is only 405px wide by the time it
+is upscaled to 1080x1920.
+
+Clips are named after their YouTube ID, so re-running tops the library up
+instead of downloading the same footage twice. See *Background footage* below
+for how a clip is then assigned to a story.
+
+Whether a video is actually free to reuse is between you and its uploader —
+"no copyright" in a title is a claim, not a licence.
+
+## 5. Dry run
 
 ```bash
 uv run python scripts/reddit_recap.py --dry-run
@@ -168,11 +223,21 @@ Fetches, filters and splits without rendering anything, and prints the parts as
 JSON. Read the scripts before spending render time — the normalizer is where
 surprises live.
 
-## 5. Render
+It is dry in the sense that nothing renders and nothing publishes; the stories
+it turned up *are* filed in the backlog, because a fetch that happened has to be
+remembered or the next run pays for it again. Nothing is lost by that — the next
+real run takes them straight out of the backlog.
+
+## 6. Render
 
 ```bash
 uv run python scripts/reddit_recap.py --max-posts 3
 ```
+
+Fetches first, then renders the `--max-posts` best stories **in the backlog** —
+whether they were found on this run or three runs ago. Taking only the current
+run's results would strand everything past the cap for ever, since a story is
+never fetched twice.
 
 Every option defaults to a `reddit_*` key under `[app]`; see
 `config.example.toml`. Arguments after `--` are forwarded verbatim to `cli.py`:
@@ -183,7 +248,7 @@ uv run python scripts/reddit_recap.py --max-posts 2 -- --voice-name en-US-AriaNe
 
 Rendered parts land in the queue as `rendered`.
 
-## 6. Review and schedule
+## 7. Review and schedule
 
 ```bash
 uv run python scripts/reddit_publish.py list
@@ -202,7 +267,7 @@ Check on jobs later:
 uv run python scripts/reddit_publish.py status --refresh
 ```
 
-## 7. Schedule it in Coolify
+## 8. Schedule it in Coolify
 
 **Resource → Scheduled Tasks**, running inside the existing container:
 
@@ -228,19 +293,27 @@ cosmetic: `video.preprocess_video` refuses to read a local material from
 anywhere else, so a library outside it would look fine in the page and be
 dropped at render time.
 
-Two ways to fill it:
+Three ways to fill it:
 
+* **Download** on the page, under *Gameplay clips*, or headless with
+  `scripts/fetch_gameplay_clips.py`. Searches YouTube and pulls a couple of
+  minutes from each result; see *4. Gameplay backgrounds* above.
 * **Upload** on the page, under *Gameplay clips*. Validation and the 200 MB
   limit are the same ones the main page's local materials use.
 * **Drop files into the folder** over a mounted volume or SFTP. A ten-minute
   parkour clip is usually past what a browser upload is worth; anything in the
   folder is listed whether or not the page ever saw it.
 
-One clip backs one part, picked by hashing the part's subject: parts of a story
-spread across the library, and re-rendering a part picks the same clip again
-rather than quietly changing the look of one video in a published set. The
-render then cuts that clip into segments the usual way, so a single long
-recording gives every part different footage.
+**One clip backs one story, not one part.** The clip is picked by hashing the
+post ID, so every part of a recap plays over the same footage — parts go out as
+a set, and swapping the background between part 1 and part 2 reads as a
+different video rather than the next instalment. Different stories still spread
+across the library, and re-rendering a story picks its clip again rather than
+quietly changing the look of one video in a published set.
+
+The render then cuts that clip into five-second segments and walks them, so one
+two-minute recording still gives a part two dozen distinct shots rather than a
+single static view.
 
 Rendering is blocked while the library is empty, with the reason on the page —
 otherwise every part fails separately at the materials stage, minutes after the
@@ -321,8 +394,13 @@ are left alone. Add your own with `[app.reddit_jargon]` in `config.toml`.
 
 ```bash
 uv run python -m pytest test/services/test_reddit_*.py \
+  test/services/test_gameplay_*.py \
   test/services/test_upload_post.py
 ```
+
+No test touches YouTube or Reddit: `search` and `download_clip` are the seams,
+and everything above them is about which candidates get picked and what is
+counted.
 
 ## Worth knowing
 
@@ -330,6 +408,11 @@ uv run python -m pytest test/services/test_reddit_*.py \
 backend fetched it, and both YouTube and TikTok have policies on repetitive
 mass-produced uploads. Volume and template-sameness are the practical risk
 factors.
+
+**Downloaded backgrounds** are the same question one layer down. "No copyright"
+is what an uploader put in a title, not a licence grant, and downloading from
+YouTube is its own matter under YouTube's terms. `gameplay_fetch` searches for
+what it is asked to search for and does not check any of that.
 
 **Attribution.** The permalink is stored on every queued post and goes into the
 YouTube description by default via `reddit_caption_template` and the scheduler.

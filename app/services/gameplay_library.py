@@ -9,10 +9,13 @@ That parent directory is not a detail: ``video.preprocess_video`` refuses to
 read a local material from anywhere else, so a library outside it would pass
 every check here and then be dropped at render time.
 
-Two ways in, because a parkour clip is often too big to push through a browser:
+Three ways in, because a parkour clip is often too big to push through a
+browser:
 
 * upload from the page, which reuses the validation and size limits in
   ``material_upload``;
+* download from YouTube with ``gameplay_fetch``, which fills an empty library
+  in one go and records the video's title here;
 * drop files into the directory over a mounted volume or SFTP, which the
   listing picks up whether or not this module ever saw them.
 
@@ -174,6 +177,25 @@ def add_clip(filename: str, source: BinaryIO) -> dict:
 
     logger.info(f"gameplay clip added: {stored_name}")
     return {"name": stored_name, "display_name": filename}
+
+
+def record_downloaded(stored_name: str, title: str, video_id: str) -> None:
+    """
+    Remember what a downloaded clip was called on YouTube.
+
+    The file is named after the video ID so a re-run can recognise it; the
+    title is what a human picks a clip out by, so the library page has
+    something to show other than ``yt-dQw4w9WgXcQ.mp4``.
+    """
+    with _index_lock:
+        index = _load_index()
+        index[stored_name] = {
+            "original_name": str(title)[:200],
+            "added_at": time.time(),
+            "source": "youtube",
+            "video_id": str(video_id),
+        }
+        _save_index(index)
 
 
 def remove_clip(name: str) -> bool:

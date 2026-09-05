@@ -57,6 +57,7 @@ class TestJobLifecycle(RedditJobsTestCase):
             "candidates": [{"post_id": "abc", "parts": []}],
             "fetched": 12,
             "matched": 3,
+            "added": 1,
             "skipped_empty": 1,
             "skipped_truncated": 0,
         }
@@ -67,11 +68,38 @@ class TestJobLifecycle(RedditJobsTestCase):
         self.assertEqual(job["status"], reddit_jobs.STATUS_COMPLETED)
         self.assertEqual(job["result"]["fetched"], 12)
         self.assertEqual(job["result"]["matched"], 3)
-        self.assertEqual(reddit_jobs.discovered_candidates(), report["candidates"])
+        self.assertEqual(job["result"]["added"], 1)
 
         # A fresh read of the file, as a second browser tab would do.
         reloaded = reddit_jobs.load_jobs()["jobs"][reddit_jobs.JOB_DISCOVER]
-        self.assertEqual(reloaded["result"]["candidates"], report["candidates"])
+        self.assertEqual(reloaded["result"]["added"], 1)
+
+    def test_the_record_holds_counts_and_not_the_stories(self):
+        """
+        The stories live in the backlog, and only there.
+
+        A second copy in the job store would be a second answer to "what has
+        been found", and the two would disagree the moment one was promoted.
+        """
+        with patch.object(
+            reddit_pipeline,
+            "discover_report",
+            return_value={
+                "candidates": [{"post_id": "abc", "parts": [{"index": 1}]}],
+                "fetched": 5,
+                "matched": 1,
+                "added": 1,
+                "skipped_empty": 0,
+                "skipped_truncated": 0,
+            },
+        ):
+            reddit_jobs.start_discovery({})
+            self._finished(reddit_jobs.JOB_DISCOVER)
+
+        result = reddit_jobs.last_discovery()
+        self.assertEqual(result["fetched"], 5)
+        self.assertEqual(result["added"], 1)
+        self.assertNotIn("candidates", result)
 
     def test_discovery_options_are_snapshotted_at_start(self):
         seen = {}
@@ -82,6 +110,7 @@ class TestJobLifecycle(RedditJobsTestCase):
                 "candidates": [],
                 "fetched": 0,
                 "matched": 0,
+                "added": 0,
                 "skipped_empty": 0,
                 "skipped_truncated": 0,
             }
@@ -113,6 +142,7 @@ class TestJobLifecycle(RedditJobsTestCase):
                 "candidates": [],
                 "fetched": 40,
                 "matched": 0,
+                "added": 0,
                 "skipped_empty": 0,
                 "skipped_truncated": 0,
             },
@@ -122,7 +152,7 @@ class TestJobLifecycle(RedditJobsTestCase):
 
         self.assertEqual(job["status"], reddit_jobs.STATUS_COMPLETED)
         self.assertEqual(job["result"]["fetched"], 40)
-        self.assertEqual(job["message"], "No story matched the filters")
+        self.assertEqual(job["message"], "No new story matched the filters")
 
     def test_second_start_is_ignored_while_one_runs(self):
         release = __import__("threading").Event()
@@ -162,29 +192,6 @@ class TestJobLifecycle(RedditJobsTestCase):
         self.assertEqual(job["status"], reddit_jobs.STATUS_FAILED)
         self.assertIn("server stopped", job["error"])
         self.assertFalse(reddit_jobs.is_running(reddit_jobs.JOB_DISCOVER))
-
-    def test_clear_candidates_keeps_the_rest_of_the_record(self):
-        with patch.object(
-            reddit_pipeline,
-            "discover_report",
-            return_value={
-                "candidates": [{"post_id": "abc"}],
-                "fetched": 5,
-                "matched": 1,
-                "skipped_empty": 0,
-                "skipped_truncated": 0,
-            },
-        ):
-            reddit_jobs.start_discovery({})
-            self._finished(reddit_jobs.JOB_DISCOVER)
-
-        reddit_jobs.clear_candidates()
-        job = reddit_jobs.get_job(reddit_jobs.JOB_DISCOVER)
-        self.assertEqual(reddit_jobs.discovered_candidates(), [])
-        self.assertEqual(job["result"]["fetched"], 5)
-        # Marked consumed, so the page says "those went to render" rather than
-        # re-reading the counts and reporting a search that found nothing.
-        self.assertTrue(job["result"]["consumed"])
 
     def test_corrupt_store_reads_as_empty(self):
         with open(
@@ -321,32 +328,33 @@ class TestWholeWorkflow(RedditJobsTestCase):
             "video_aspect": "9:16", "voice_name": "v", "subtitle_enabled": True,
         }
 
-        # 1. Find, in the background.
-        with patch.object(
-            reddit_pipeline,
-            "discover_report",
-            return_value={
+        # 1. Find, in the background. Discovery files the story in the backlog.
+        def discover(_options):
+            reddit_queue.record_discovered(self._split())
+            return {
                 "candidates": [self._split()],
                 "fetched": 10,
                 "matched": 1,
+                "added": 1,
                 "skipped_empty": 0,
                 "skipped_truncated": 0,
-            },
-        ):
+            }
+
+        with patch.object(reddit_pipeline, "discover_report", side_effect=discover):
             reddit_jobs.start_discovery(options)
             self._finished(reddit_jobs.JOB_DISCOVER)
 
-        candidates = reddit_jobs.discovered_candidates()
-        self.assertEqual(len(candidates), 1)
+        self.assertEqual(
+            [post["post_id"] for post in reddit_queue.backlog()], ["abc123"]
+        )
 
-        # 2. Render: submitted to the task pool, recorded as rendering.
+        # 2. Promote: submitted to the task pool, recorded as rendering.
         submitted = []
-        reddit_pipeline.submit_parts(
-            candidates,
+        reddit_pipeline.promote_posts(
+            ["abc123"],
             options,
             lambda task_id, params, part, split: submitted.append(task_id),
         )
-        reddit_jobs.clear_candidates()
         post = reddit_queue.get_post("abc123")
         self.assertEqual(post["parts"][0]["status"], reddit_queue.STATUS_RENDERING)
         self.assertEqual(reddit_queue.post_stage(post), reddit_queue.STATUS_RENDERING)

@@ -107,15 +107,16 @@ def resolve_options(args: argparse.Namespace) -> dict:
     )
 
 
-def manifest_row(part: dict, options: dict) -> dict:
+def manifest_row(part: dict, options: dict, key: str = "") -> dict:
     """
     One part as VideoParams overrides for cli.py.
 
     Built from the same ``build_video_params`` the WebUI submits, so a cron run
     and a click produce the same video: the same background, the same clip, the
-    same subtitle style.
+    same subtitle style. ``key`` identifies the story, so all of its parts play
+    over one clip.
     """
-    params = reddit_pipeline.build_video_params(part, options)
+    params = reddit_pipeline.build_video_params(part, options, key)
     row = {
         "video_subject": params.video_subject,
         "video_script": params.video_script,
@@ -144,9 +145,11 @@ def write_manifest(splits: list[dict], options: dict) -> str:
 
     with open(path, "w", encoding="utf-8") as handle:
         for split in splits:
+            key = reddit_pipeline.story_key(split)
             for part in split["parts"]:
                 handle.write(
-                    json.dumps(manifest_row(part, options), ensure_ascii=False) + "\n"
+                    json.dumps(manifest_row(part, options, key), ensure_ascii=False)
+                    + "\n"
                 )
     return path
 

@@ -10,8 +10,9 @@ per browser session and is exactly what made "Find stories" look like it never
 finished: the fetch ran inside the page script, and any interruption threw the
 result away with no trace that it had ever run.
 
-    start_discovery()   fetch → filter → split, results persisted for the page
+    start_discovery()   fetch → filter → split into the persistent backlog
     start_scheduling()  hand approved parts to Upload-Post on a calendar
+    start_clip_fetch()  fill the gameplay library from YouTube
     ensure_worker()     the loop that advances renders and uploads unattended
 
 The worker is what makes the queue move without anybody watching it: renders
@@ -30,7 +31,7 @@ from uuid import uuid4
 
 from loguru import logger
 
-from app.services import reddit_pipeline, state as sm, upload_post
+from app.services import gameplay_fetch, reddit_pipeline, state as sm, upload_post
 from app.utils import utils
 
 
@@ -38,7 +39,8 @@ JOBS_FILE_NAME = "reddit_jobs.json"
 
 JOB_DISCOVER = "discover"
 JOB_SCHEDULE = "schedule"
-JOB_KINDS = (JOB_DISCOVER, JOB_SCHEDULE)
+JOB_FETCH_CLIPS = "fetch_clips"
+JOB_KINDS = (JOB_DISCOVER, JOB_SCHEDULE, JOB_FETCH_CLIPS)
 
 STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
@@ -275,7 +277,12 @@ def _start(kind: str, target, message: str) -> dict:
 
 def start_discovery(options: dict) -> dict:
     """
-    Find stories in the background, keeping the candidates on disk.
+    Find stories in the background, adding them to the backlog on disk.
+
+    Only the counts are kept here. The stories themselves go straight into
+    ``reddit_queue`` as the backlog, so there is one place that knows what has
+    been found — which is what stops a story being offered twice — and this
+    record is purely "how did the last search go".
 
     ``options`` is snapshotted at call time: the job must not read settings the
     user changes while it runs.
@@ -287,14 +294,14 @@ def start_discovery(options: dict) -> dict:
         outcome = reddit_pipeline.discover_report(snapshot)
         report(message="Splitting stories into parts…", progress=80)
 
-        candidates = outcome["candidates"]
+        added = outcome["added"]
         return {
             "message": (
-                f"{len(candidates)} stories ready"
-                if candidates
-                else "No story matched the filters"
+                f"{added} stories added to the backlog"
+                if added
+                else "No new story matched the filters"
             ),
-            "candidates": candidates,
+            "added": added,
             "fetched": outcome["fetched"],
             "matched": outcome["matched"],
             "skipped_empty": outcome["skipped_empty"],
@@ -305,31 +312,12 @@ def start_discovery(options: dict) -> dict:
     return _start(JOB_DISCOVER, job, "Starting…")
 
 
-def discovered_candidates() -> list[dict]:
-    """Stories from the last completed discovery run, or an empty list."""
+def last_discovery() -> dict:
+    """Counts from the last completed search, or an empty dict."""
     job = get_job(JOB_DISCOVER)
     if not job or job["status"] != STATUS_COMPLETED:
-        return []
-    candidates = job["result"].get("candidates")
-    return candidates if isinstance(candidates, list) else []
-
-
-def clear_candidates() -> None:
-    """
-    Drop the candidate list once its stories have been handed to rendering.
-
-    The run is marked consumed rather than deleted, so the page can say "those
-    went to render" instead of re-reading the counts and concluding the search
-    found nothing.
-    """
-    with _jobs_lock:
-        job = get_job(JOB_DISCOVER)
-        if not job:
-            return
-        result = dict(job["result"])
-        result["candidates"] = []
-        result["consumed"] = True
-        _write_job(JOB_DISCOVER, result=result)
+        return {}
+    return job["result"]
 
 
 # -----------------------------------------------------------------------------
@@ -374,6 +362,48 @@ def start_scheduling(parts: list[dict], slots: list[str], platforms: list[str]) 
         }
 
     return _start(JOB_SCHEDULE, job, "Starting…")
+
+
+# -----------------------------------------------------------------------------
+# Gameplay clips
+# -----------------------------------------------------------------------------
+
+
+def start_clip_fetch(query: str, count: int) -> dict:
+    """
+    Download gameplay backgrounds in the background.
+
+    Twenty clips is around twenty minutes of downloading, so this cannot run in
+    the page script for the same reason a fetch cannot: the websocket will not
+    survive it, and the work would die with the tab that started it.
+    """
+    search = str(query or gameplay_fetch.DEFAULT_QUERY)
+    wanted = max(int(count), 1)
+
+    def job(report) -> dict:
+        def progress(done: int, total: int, title: str) -> None:
+            report(
+                message=f"{done + 1}/{total}: {title[:60]}",
+                # Never quite 100 while work remains: the last clip is still
+                # downloading when it reports.
+                progress=min(int(done * 100 / max(total, 1)), 95),
+            )
+
+        report(message="Searching YouTube…", progress=5)
+        outcome = gameplay_fetch.fill_library(
+            query=search, count=wanted, on_progress=progress
+        )
+        return {
+            "message": (
+                f"{outcome['downloaded']} clips downloaded"
+                if outcome["downloaded"]
+                else (outcome["error"] or "No clip was downloaded")
+            ),
+            **{key: value for key, value in outcome.items() if key != "message"},
+            "query": search,
+        }
+
+    return _start(JOB_FETCH_CLIPS, job, "Starting…")
 
 
 # -----------------------------------------------------------------------------

@@ -500,10 +500,21 @@ reddit_final_outro = ""
 
 # What plays behind the narration:
 #   "gameplay"  clips from the library in storage/local_videos/gameplay —
-#               Minecraft parkour and the like. Upload them on the Reddit
-#               Recaps page, or drop the files straight into that folder.
+#               Minecraft parkour and the like. Download them on the Reddit
+#               Recaps page, upload them there, or drop the files straight
+#               into that folder.
 #   "pexels" / "pixabay" / "coverr"  stock footage searched with the terms below.
 reddit_background = "gameplay"
+
+# Every part of one story plays over the same clip, so a two-part recap reads
+# as one video rather than two. Different stories get different clips.
+
+# What the "Download" button on the Reddit Recaps page searches YouTube for,
+# and how many clips it fetches. Only a couple of minutes is taken from each
+# result — see docs/reddit-recaps.md — so twenty clips is roughly 1.8 GB.
+# The same job runs headless: scripts/fetch_gameplay_clips.py
+reddit_gameplay_query = "Minecraft Parkour Gameplay No Copyright"
+reddit_gameplay_count = 20
 
 # Material search terms shared by every part. Only used by the stock sources;
 # a gameplay background has nothing to search for.
