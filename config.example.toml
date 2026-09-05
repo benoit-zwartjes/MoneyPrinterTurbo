@@ -498,16 +498,36 @@ reddit_part_intro = "Part {index}."
 reddit_part_outro = "Part {next_index} is up next — follow so you catch it."
 reddit_final_outro = ""
 
-# Material search terms shared by every part. Story recaps use filler b-roll,
-# so generic calm footage reads better than terms pulled from the story.
+# What plays behind the narration:
+#   "gameplay"  clips from the library in storage/local_videos/gameplay —
+#               Minecraft parkour and the like. Upload them on the Reddit
+#               Recaps page, or drop the files straight into that folder.
+#   "pexels" / "pixabay" / "coverr"  stock footage searched with the terms below.
+reddit_background = "gameplay"
+
+# Material search terms shared by every part. Only used by the stock sources;
+# a gameplay background has nothing to search for.
 reddit_video_terms = "calm abstract background, slow motion texture, ambient loop"
 
 # Render settings applied to every part. The Reddit Recaps page writes these
 # back when you change them there.
-reddit_video_source = "pexels"
 reddit_video_aspect = "9:16"
 reddit_voice_name = "en-US-AriaNeural-Female"
 reddit_subtitle_enabled = true
+
+# Subtitle look. Yellow on a black outline is the convention for this format
+# and stays readable over busy gameplay footage, which white does not.
+# reddit_text_thickness is the outline weight: thin, medium, thick, extra thick.
+reddit_text_color = "#FFFF00"
+reddit_text_thickness = "thick"
+reddit_stroke_color = "#000000"
+reddit_font_name = "MicrosoftYaHeiBold.ttc"
+reddit_font_size = 60
+
+# What rejecting a story in the review queue does. With this on, rejecting also
+# stops any part still rendering and deletes the videos; the story, its link and
+# the narration of every part stay in the library either way.
+reddit_reject_discards_videos = true
 
 # Caption used when scheduling, by both the Reddit Recaps page and
 # scripts/reddit_publish.py. {title}, {subreddit}, {index} and {total} are

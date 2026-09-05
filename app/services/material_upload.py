@@ -46,6 +46,33 @@ def uploaded_material_dir(create: bool = True) -> str:
     return utils.storage_dir("local_videos", create=create)
 
 
+def resolve_upload_dir(target_dir: str | None, create: bool = True) -> str:
+    """
+    Where an upload may be written.
+
+    ``target_dir`` lets a caller keep its own materials apart — the gameplay
+    background library is a subdirectory rather than a second pile in the same
+    folder — but it must stay inside the local material root: that root is the
+    only place ``video.preprocess_video`` will read a material from, and a path
+    escaping it would be an arbitrary write.
+    """
+    root = uploaded_material_dir(create=create)
+    if not target_dir:
+        return root
+
+    resolved = os.path.realpath(
+        target_dir
+        if os.path.isabs(target_dir)
+        else os.path.join(os.path.realpath(root), target_dir)
+    )
+    if os.path.commonpath([os.path.realpath(root), resolved]) != os.path.realpath(root):
+        raise MaterialServiceError("upload directory is outside local material storage")
+
+    if create:
+        os.makedirs(resolved, exist_ok=True)
+    return resolved
+
+
 def _remove_staged_file(file_path: str) -> None:
     if not file_path or not os.path.exists(file_path):
         return
@@ -169,7 +196,7 @@ def _validate_video(
 
 
 def _stage_material_upload(
-    filename: str, source: BinaryIO
+    filename: str, source: BinaryIO, target_dir: str | None = None
 ) -> tuple[str, Literal["video", "image"], str, int]:
     safe_name = sanitize_material_filename(filename)
     material_kind = _material_kind(safe_name)
@@ -181,7 +208,7 @@ def _stage_material_upload(
     maximum_megabytes = maximum_bytes // (1024 * 1024)
 
     try:
-        target_dir = uploaded_material_dir(create=True)
+        target_dir = resolve_upload_dir(target_dir, create=True)
     except OSError as exc:
         raise MaterialServiceError("failed to prepare local material storage") from exc
 
@@ -232,10 +259,17 @@ def _stage_material_upload(
             pass
 
 
-def save_material_upload(filename: str, source: BinaryIO) -> str:
-    """Validate and atomically persist an uploaded local video or image."""
+def save_material_upload(
+    filename: str, source: BinaryIO, target_dir: str | None = None
+) -> str:
+    """
+    Validate and atomically persist an uploaded local video or image.
+
+    ``target_dir`` defaults to the local material root and may name a
+    subdirectory of it; anything outside is refused.
+    """
     safe_name, material_kind, temp_path, total_bytes = _stage_material_upload(
-        filename, source
+        filename, source, target_dir
     )
     extension = Path(safe_name).suffix.lower()
     stored_name = f"{uuid4().hex}{extension}"

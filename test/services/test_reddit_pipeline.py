@@ -44,7 +44,7 @@ def _options(**overrides) -> dict:
         "part_seconds": 20,
         "max_parts": 10,
         "video_terms": "test terms",
-        "video_source": "pexels",
+        "background": "pexels",
         "video_aspect": "9:16",
         "voice_name": "en-US-AriaNeural-Female",
         "subtitle_enabled": True,
@@ -503,6 +503,175 @@ class TestSyncUploads(PipelineTestCase):
             check_status=lambda job_id: polled.append(job_id) or {}
         )
         self.assertEqual(polled, [])
+
+
+class TestBackground(PipelineTestCase):
+    def _part(self, index=1, subject="A story (Part 1/2)"):
+        return {
+            "index": index,
+            "total": 2,
+            "subject": subject,
+            "script": "Once upon a time.",
+            "estimated_seconds": 40.0,
+        }
+
+    def test_gameplay_renders_a_local_clip_rather_than_a_stock_search(self):
+        params = reddit_pipeline.build_video_params(
+            self._part(),
+            _options(background="gameplay", gameplay_clips=["/clips/parkour.mp4"]),
+        )
+        self.assertEqual(params.video_source, "local")
+        self.assertEqual(params.video_materials[0].url, "/clips/parkour.mp4")
+        self.assertEqual(params.video_materials[0].provider, "local")
+        # Search terms are dead weight when the footage is already on disk.
+        self.assertEqual(params.video_terms, "")
+
+    def test_a_stock_background_is_still_a_stock_search(self):
+        params = reddit_pipeline.build_video_params(
+            self._part(), _options(background="pixabay")
+        )
+        self.assertEqual(params.video_source, "pixabay")
+        self.assertIsNone(params.video_materials)
+        self.assertEqual(params.video_terms, "test terms")
+
+    def test_the_library_is_snapshotted_once_per_batch(self):
+        # A clip removed mid-batch must not renumber what the remaining parts
+        # were already assigned.
+        seen = []
+        with patch.object(
+            reddit_pipeline.gameplay_library, "paths", return_value=["/a.mp4"]
+        ) as paths:
+            reddit_pipeline.submit_parts(
+                [
+                    {
+                        "post_id": "aaa", "subreddit": "x", "title": "t",
+                        "permalink": "", "score": 0, "truncated": False,
+                        "parts": [self._part(1), self._part(2, "A story (Part 2/2)")],
+                    }
+                ],
+                _options(background="gameplay"),
+                lambda task_id, params, part, split: seen.append(params),
+            )
+
+        paths.assert_called_once()
+        self.assertEqual(
+            [params.video_materials[0].url for params in seen], ["/a.mp4", "/a.mp4"]
+        )
+
+    def test_an_empty_library_is_reported_before_rendering(self):
+        with patch.object(
+            reddit_pipeline.gameplay_library, "is_ready", return_value=False
+        ):
+            issues = reddit_pipeline.background_issues(_options(background="gameplay"))
+        self.assertEqual(len(issues), 1)
+        self.assertIn("gameplay library is empty", issues[0].lower())
+
+    def test_a_stock_background_needs_no_library(self):
+        with patch.object(
+            reddit_pipeline.gameplay_library, "is_ready", return_value=False
+        ):
+            self.assertEqual(
+                reddit_pipeline.background_issues(_options(background="pexels")), []
+            )
+
+
+class TestSubtitleStyle(PipelineTestCase):
+    def _part(self):
+        return {"index": 1, "total": 1, "subject": "s", "script": "text"}
+
+    def test_the_default_is_thick_yellow(self):
+        with patch.dict(reddit_pipeline.config.app, {}, clear=False):
+            options = reddit_pipeline.resolve_options()
+        params = reddit_pipeline.build_video_params(self._part(), options)
+
+        self.assertEqual(params.text_fore_color, "#FFFF00")
+        self.assertEqual(params.stroke_color, "#000000")
+        self.assertEqual(
+            params.stroke_width, reddit_pipeline.TEXT_THICKNESS["thick"]
+        )
+
+    def test_each_thickness_level_maps_to_an_outline_width(self):
+        widths = [
+            reddit_pipeline.stroke_width_for({"text_thickness": level})
+            for level in reddit_pipeline.TEXT_THICKNESS
+        ]
+        self.assertEqual(widths, sorted(widths))
+        self.assertEqual(len(set(widths)), len(widths))
+
+    def test_an_unknown_thickness_falls_back_to_the_default(self):
+        self.assertEqual(
+            reddit_pipeline.stroke_width_for({"text_thickness": "nonsense"}),
+            reddit_pipeline.TEXT_THICKNESS[reddit_pipeline.DEFAULT_TEXT_THICKNESS],
+        )
+
+    def test_the_chosen_colour_and_thickness_reach_the_render(self):
+        params = reddit_pipeline.build_video_params(
+            self._part(),
+            _options(text_color="#00FF00", text_thickness="thin"),
+        )
+        self.assertEqual(params.text_fore_color, "#00FF00")
+        self.assertEqual(params.stroke_width, reddit_pipeline.TEXT_THICKNESS["thin"])
+
+
+class TestPurgeDiscarded(PipelineTestCase):
+    def _discarded(self, video_path=None):
+        reddit_queue.record_post(
+            {
+                "post_id": "aaa", "subreddit": "x", "title": "t",
+                "permalink": "", "score": 0, "truncated": False,
+                "parts": [{"index": 1, "total": 1}],
+            },
+            [{"index": 1, "total": 1, "status": reddit_queue.STATUS_RENDERING,
+              "task_id": "task-1", "video_path": video_path}],
+        )
+        reddit_queue.reject_post("aaa", discard_video=True)
+
+    def _rendered_file(self):
+        task_dir = os.path.join(self._temp_dir.name, "tasks", "task-1")
+        os.makedirs(task_dir, exist_ok=True)
+        path = os.path.join(task_dir, "final-1.mp4")
+        with open(path, "wb") as handle:
+            handle.write(b"video")
+        return path
+
+    def test_a_render_that_finished_after_rejection_is_deleted(self):
+        self._discarded()
+        video = self._rendered_file()
+        task = {"state": const.TASK_STATE_COMPLETE, "videos": [video]}
+
+        self.assertEqual(reddit_pipeline.purge_discarded(lambda _: task)["purged"], 1)
+        self.assertFalse(os.path.exists(os.path.dirname(video)))
+        # Nothing left to follow, so later passes skip it.
+        self.assertEqual(reddit_queue.discarded_parts(), [])
+
+    def test_a_render_still_in_flight_is_left_to_finish(self):
+        self._discarded()
+        task = {"state": const.TASK_STATE_PROCESSING}
+
+        self.assertEqual(reddit_pipeline.purge_discarded(lambda _: task)["purged"], 0)
+        self.assertEqual(len(reddit_queue.discarded_parts()), 1)
+
+    def test_a_forgotten_task_stops_being_followed(self):
+        self._discarded()
+        self.assertEqual(reddit_pipeline.purge_discarded(lambda _: None)["purged"], 0)
+        self.assertEqual(reddit_queue.discarded_parts(), [])
+
+    def test_parts_rejected_without_discarding_are_never_purged(self):
+        reddit_queue.record_post(
+            {
+                "post_id": "bbb", "subreddit": "x", "title": "t",
+                "permalink": "", "score": 0, "truncated": False,
+                "parts": [{"index": 1, "total": 1}],
+            },
+            [{"index": 1, "total": 1, "status": reddit_queue.STATUS_RENDERED,
+              "task_id": "task-1"}],
+        )
+        reddit_queue.reject_post("bbb")
+
+        video = self._rendered_file()
+        task = {"state": const.TASK_STATE_COMPLETE, "videos": [video]}
+        self.assertEqual(reddit_pipeline.purge_discarded(lambda _: task)["purged"], 0)
+        self.assertTrue(os.path.exists(video))
 
 
 if __name__ == "__main__":

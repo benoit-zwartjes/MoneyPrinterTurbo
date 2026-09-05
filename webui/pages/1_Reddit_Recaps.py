@@ -18,6 +18,7 @@ scripts/reddit_recap.py cannot drift apart.
 """
 
 import os
+import re
 import sys
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
@@ -35,6 +36,8 @@ sys.path.insert(0, root_dir)
 from app.config import config  # noqa: E402
 from app.models.schema import VideoAspect  # noqa: E402
 from app.services import (  # noqa: E402
+    gameplay_library,
+    material_upload,
     reddit_jobs,
     reddit_pipeline,
     reddit_queue,
@@ -53,8 +56,19 @@ if _style_file.exists():
         unsafe_allow_html=True,
     )
 
-_VIDEO_SOURCES = ("pexels", "pixabay", "coverr")
 _LISTING_HELP = "top uses the time window below; hot, new and rising ignore it."
+_BACKGROUND_LABELS = {
+    reddit_pipeline.BACKGROUND_GAMEPLAY: "Gameplay footage (Minecraft parkour)",
+    "pexels": "Pexels stock video",
+    "pixabay": "Pixabay stock video",
+    "coverr": "Coverr stock video",
+}
+_THICKNESS_LABELS = {
+    "thin": "Thin",
+    "medium": "Medium",
+    "thick": "Thick",
+    "extra thick": "Extra thick",
+}
 # Only polled while the server actually has work in flight; an idle page falls
 # back to a static render and stops asking.
 _LIVE_REFRESH_SECONDS = "2s"
@@ -212,6 +226,100 @@ def _render_setup() -> bool:
 
 
 # -----------------------------------------------------------------------------
+# Background footage
+# -----------------------------------------------------------------------------
+
+
+def _preview_subtitle(color: str, thickness: str, font_size: int) -> None:
+    """
+    A rough sample of the caption over dark footage.
+
+    Approximate on purpose — the browser is not MoviePy — but it answers the
+    only question the two controls raise: is this readable over gameplay.
+    """
+    stroke = reddit_pipeline.TEXT_THICKNESS.get(
+        thickness, reddit_pipeline.TEXT_THICKNESS[reddit_pipeline.DEFAULT_TEXT_THICKNESS]
+    )
+    # The colour reaches inline HTML, and config.toml can be edited by hand.
+    # Anything that is not a hex colour is not one worth previewing.
+    if not re.fullmatch(r"#[0-9A-Fa-f]{3,8}", str(color or "")):
+        color = reddit_pipeline.DEFAULT_TEXT_COLOR
+    # The video is 1080 wide and this strip is a few hundred pixels, so both
+    # numbers are halved to keep the proportions honest.
+    st.markdown(
+        f"""
+        <div style="background:#141414;border-radius:8px;padding:16px;text-align:center;">
+          <span style="font-family:system-ui,sans-serif;font-weight:800;
+                       font-size:{max(16, font_size // 2)}px;color:{color};
+                       -webkit-text-stroke:{max(1, stroke // 2)}px {reddit_pipeline.DEFAULT_STROKE_COLOR};
+                       paint-order:stroke fill;">AND THEN SHE SAID WHAT?</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption("Approximate preview of the subtitle style.")
+
+
+def _render_background_library(background: str) -> None:
+    """Manage the clips that play behind the narration."""
+    if background != reddit_pipeline.BACKGROUND_GAMEPLAY:
+        return
+
+    library = gameplay_library.clips()
+    with st.expander(
+        f"Gameplay clips ({len(library)})", expanded=not library
+    ):
+        st.caption(
+            "Each part plays over one of these clips. Minecraft parkour is the "
+            "usual choice; anything long and visually busy works. Clips stay on "
+            "the server and are reused by every render."
+        )
+        st.caption(
+            f"Too big to upload? Drop files straight into `{gameplay_library.library_dir(create=False)}` "
+            "on the server — they show up here."
+        )
+
+        with st.form("reddit_gameplay_upload", clear_on_submit=True):
+            uploaded = st.file_uploader(
+                "Add clips",
+                type=[ext.lstrip(".") for ext in gameplay_library.SUPPORTED_EXTENSIONS],
+                accept_multiple_files=True,
+                key="reddit_gameplay_uploader",
+            )
+            if st.form_submit_button("Add to library", type="primary") and uploaded:
+                _add_gameplay_clips(uploaded)
+
+        if not library:
+            st.warning("The library is empty, so nothing can render yet.")
+            return
+
+        for clip in library:
+            row = st.columns([4, 1, 1])
+            row[0].write(clip["display_name"])
+            row[1].caption(f"{clip['size_bytes'] / (1024 * 1024):.0f} MB")
+            if row[2].button("Remove", key=f"gameplay_remove_{clip['name']}"):
+                gameplay_library.remove_clip(clip["name"])
+                st.rerun()
+
+
+def _add_gameplay_clips(uploaded) -> None:
+    added = 0
+    for upload in uploaded:
+        try:
+            gameplay_library.add_clip(upload.name, upload)
+            added += 1
+        except material_upload.MaterialUploadError as exc:
+            st.error(f"{upload.name}: {exc}")
+        except material_upload.MaterialServiceError as exc:
+            logger.exception(f"failed to store gameplay clip {upload.name}: {exc}")
+            st.error(f"{upload.name} could not be stored on the server.")
+
+    if added:
+        st.success(f"{added} clips added.")
+        st.rerun()
+
+
+# -----------------------------------------------------------------------------
 # Options
 # -----------------------------------------------------------------------------
 
@@ -331,15 +439,20 @@ def _render_options() -> dict:
                 ),
                 key="reddit_video_aspect_input",
             )
-            video_source = st.selectbox(
-                "Video Source",
-                options=list(_VIDEO_SOURCES),
-                index=list(_VIDEO_SOURCES).index(
-                    config.app.get("reddit_video_source", "pexels")
-                    if config.app.get("reddit_video_source") in _VIDEO_SOURCES
-                    else "pexels"
+            backgrounds = list(reddit_pipeline.BACKGROUNDS)
+            background = st.selectbox(
+                "Background",
+                options=backgrounds,
+                index=backgrounds.index(
+                    config.app.get(
+                        "reddit_background", reddit_pipeline.DEFAULT_BACKGROUND
+                    )
+                    if config.app.get("reddit_background") in backgrounds
+                    else reddit_pipeline.DEFAULT_BACKGROUND
                 ),
-                key="reddit_video_source_input",
+                format_func=lambda value: _BACKGROUND_LABELS[value],
+                help="Gameplay plays clips from the library below. The stock sources search for the material terms instead.",
+                key="reddit_background_input",
             )
             subtitle_enabled = st.checkbox(
                 "Enable Subtitles",
@@ -362,7 +475,8 @@ def _render_options() -> dict:
                     "reddit_video_terms", reddit_pipeline.DEFAULT_VIDEO_TERMS
                 ),
                 height=88,
-                help="Shared by every part. Story recaps use filler b-roll, so generic calm footage reads better than terms from the story.",
+                help="Only used by the stock sources. Story recaps use filler b-roll, so generic calm footage reads better than terms from the story.",
+                disabled=background == reddit_pipeline.BACKGROUND_GAMEPLAY,
                 key="reddit_video_terms_input",
             )
             caption_template = st.text_input(
@@ -374,6 +488,50 @@ def _render_options() -> dict:
                 help="Placeholders: {title}, {subreddit}, {index}, {total}.",
                 key="reddit_caption_template_input",
             )
+
+        st.markdown("**Subtitles**")
+        col_g, col_h, col_i = st.columns(3)
+        with col_g:
+            text_color = st.color_picker(
+                "Text colour",
+                value=str(
+                    config.app.get(
+                        "reddit_text_color", reddit_pipeline.DEFAULT_TEXT_COLOR
+                    )
+                ),
+                key="reddit_text_color_input",
+            )
+        with col_h:
+            thickness_values = list(reddit_pipeline.TEXT_THICKNESS)
+            current_thickness = str(
+                config.app.get(
+                    "reddit_text_thickness", reddit_pipeline.DEFAULT_TEXT_THICKNESS
+                )
+            ).lower()
+            text_thickness = st.selectbox(
+                "Text thickness",
+                options=thickness_values,
+                index=thickness_values.index(
+                    current_thickness
+                    if current_thickness in thickness_values
+                    else reddit_pipeline.DEFAULT_TEXT_THICKNESS
+                ),
+                format_func=lambda value: _THICKNESS_LABELS[value],
+                help="How heavy the outline around each word is. Thicker stays readable over busy gameplay footage.",
+                key="reddit_text_thickness_input",
+            )
+        with col_i:
+            font_size = st.number_input(
+                "Text size",
+                min_value=30, max_value=120, step=2,
+                value=int(
+                    config.app.get(
+                        "reddit_font_size", reddit_pipeline.DEFAULT_FONT_SIZE
+                    )
+                ),
+                key="reddit_font_size_input",
+            )
+        _preview_subtitle(text_color, text_thickness, int(font_size))
 
     subreddit_list = [s.strip() for s in subreddits.split(",") if s.strip()]
     for key, value in {
@@ -390,8 +548,11 @@ def _render_options() -> dict:
         "reddit_max_parts": int(max_parts),
         "reddit_words_per_minute": int(words_per_minute),
         "reddit_video_aspect": video_aspect,
-        "reddit_video_source": video_source,
+        "reddit_background": background,
         "reddit_subtitle_enabled": bool(subtitle_enabled),
+        "reddit_text_color": text_color,
+        "reddit_text_thickness": text_thickness,
+        "reddit_font_size": int(font_size),
         "reddit_voice_name": voice_name,
         "reddit_video_terms": video_terms,
         "reddit_caption_template": caption_template,
@@ -534,6 +695,8 @@ def _render_last_discovery(job: dict | None) -> None:
 def _render_find(options: dict, ready: bool) -> None:
     st.subheader("Find stories")
 
+    background_issues = reddit_pipeline.background_issues(options)
+
     running = reddit_jobs.is_running(reddit_jobs.JOB_DISCOVER)
     col_button, col_note = st.columns([1, 3])
     with col_button:
@@ -584,12 +747,15 @@ def _render_find(options: dict, ready: bool) -> None:
                 selected.append(split)
 
     st.divider()
+    for issue in background_issues:
+        st.warning(issue)
+
     col_render, col_discard = st.columns([1, 1])
     with col_render:
         if st.button(
             f"Render {len(selected)} stories",
             type="primary",
-            disabled=not selected,
+            disabled=not selected or bool(background_issues),
             use_container_width=True,
             key="reddit_render_button",
         ):
@@ -632,6 +798,13 @@ def _submit_renders(splits: list[dict], options: dict) -> None:
 # -----------------------------------------------------------------------------
 
 
+def _group_by_post(parts: list[dict]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for part in parts:
+        grouped.setdefault(part["post_id"], []).append(part)
+    return grouped
+
+
 def _render_review() -> None:
     rendering = reddit_queue.parts_with_status(reddit_queue.STATUS_RENDERING)
     pending = reddit_queue.pending_review()
@@ -644,20 +817,41 @@ def _render_review() -> None:
             reddit_jobs.refresh_now()
             st.rerun()
 
+    discard_on_reject = st.checkbox(
+        "Rejecting stops the story and deletes its videos",
+        value=bool(config.app.get("reddit_reject_discards_videos", True)),
+        help=(
+            "The story, its link and the narration of every part stay in All "
+            "stories — only the footage goes. Parts still rendering are stopped "
+            "from reaching the queue, and their file is deleted once the render "
+            "finishes. Turn this off to keep rejected videos on disk."
+        ),
+        key="reddit_reject_discards_input",
+    )
+    _set_config("reddit_reject_discards_videos", bool(discard_on_reject))
+
     if rendering:
         st.info(
             f"{len(rendering)} parts still rendering. They appear here on their "
             "own — the server promotes them as each render finishes."
         )
+        for post_id, parts in _group_by_post(rendering).items():
+            row = st.columns([4, 1])
+            row[0].caption(
+                f"{parts[0]['title'][:70]} · {len(parts)} parts rendering"
+            )
+            if row[1].button("Stop", key=f"stop_{post_id}", use_container_width=True):
+                # Stopping is rejecting with the footage discarded: there is no
+                # cancel in the task pool, so the render finishes into the bin.
+                reddit_queue.reject_post(post_id, discard_video=True)
+                st.rerun()
 
     if not pending:
         if not rendering:
             st.caption("Nothing waiting for review.")
         return
 
-    by_post: dict[str, list[dict]] = {}
-    for part in pending:
-        by_post.setdefault(part["post_id"], []).append(part)
+    by_post = _group_by_post(pending)
 
     for post_id, parts in by_post.items():
         head = parts[0]
@@ -684,7 +878,9 @@ def _render_review() -> None:
                     st.rerun()
             with actions[1]:
                 if st.button("Reject", key=f"reject_{post_id}"):
-                    reddit_queue.reject_post(post_id)
+                    reddit_queue.reject_post(
+                        post_id, discard_video=discard_on_reject
+                    )
                     st.rerun()
 
     if len(by_post) > 1 and st.button("Approve all", key="reddit_approve_all"):
@@ -908,6 +1104,17 @@ def _render_library() -> None:
                 hide_index=True,
             )
 
+            scripts = [part for part in post["parts"] if part.get("script")]
+            if scripts:
+                st.markdown("**Story text**")
+                st.caption(
+                    "Kept whatever happens to the video, so a rejected story "
+                    "can still be read or re-used."
+                )
+                for part in scripts:
+                    st.caption(f"Part {part['index']}/{part['total']}")
+                    st.write(part["script"])
+
 
 # -----------------------------------------------------------------------------
 
@@ -950,6 +1157,7 @@ def main() -> None:
 
     ready = _render_setup()
     options = _render_options()
+    _render_background_library(options["background"])
 
     _render_metrics()
 

@@ -60,6 +60,25 @@ class RedditRecapTestCase(unittest.TestCase):
         return path
 
 
+
+def _render_options(**overrides) -> dict:
+    """The option set as resolve_options builds it, without touching config."""
+    options = {
+        "background": "pexels",
+        "video_terms": "test terms",
+        "video_aspect": "9:16",
+        "voice_name": "en-US-AriaNeural-Female",
+        "subtitle_enabled": True,
+        "text_color": reddit_recap.reddit_pipeline.DEFAULT_TEXT_COLOR,
+        "text_thickness": reddit_recap.reddit_pipeline.DEFAULT_TEXT_THICKNESS,
+        "stroke_color": reddit_recap.reddit_pipeline.DEFAULT_STROKE_COLOR,
+        "font_name": reddit_recap.reddit_pipeline.DEFAULT_FONT_NAME,
+        "font_size": reddit_recap.reddit_pipeline.DEFAULT_FONT_SIZE,
+    }
+    options.update(overrides)
+    return options
+
+
 class TestWriteManifest(RedditRecapTestCase):
     def test_writes_one_jsonl_line_per_part(self):
         posts = [_reddit_post("aaa", sentences=20), _reddit_post("bbb", sentences=20)]
@@ -74,14 +93,41 @@ class TestWriteManifest(RedditRecapTestCase):
                 }
             )
 
-        path = reddit_recap.write_manifest(splits, "calm background")
+        options = _render_options(video_terms="calm background")
+        path = reddit_recap.write_manifest(splits, options)
         with open(path, "r", encoding="utf-8") as handle:
             lines = [json.loads(line) for line in handle if line.strip()]
 
         self.assertEqual(len(lines), sum(len(s["parts"]) for s in splits))
-        self.assertEqual(set(lines[0]), {"video_subject", "video_script", "video_terms"})
         self.assertEqual(lines[0]["video_terms"], "calm background")
+        self.assertEqual(lines[0]["video_source"], "pexels")
         self.assertTrue(lines[0]["video_script"])
+
+    def test_the_manifest_carries_the_background_and_the_subtitle_style(self):
+        """A cron run must produce the same video a click would."""
+        part = {
+            "index": 1, "total": 1, "subject": "A story (Part 1/1)",
+            "script": "Once upon a time.", "estimated_seconds": 40.0,
+        }
+        row = reddit_recap.manifest_row(
+            part,
+            _render_options(
+                background="gameplay",
+                gameplay_clips=["/clips/parkour.mp4"],
+                text_color="#FFFF00",
+                text_thickness="thick",
+            ),
+        )
+
+        self.assertEqual(row["video_source"], "local")
+        self.assertEqual(
+            row["video_materials"], [{"provider": "local", "url": "/clips/parkour.mp4"}]
+        )
+        self.assertEqual(row["text_fore_color"], "#FFFF00")
+        self.assertEqual(
+            row["stroke_width"],
+            reddit_recap.reddit_pipeline.TEXT_THICKNESS["thick"],
+        )
 
 
 class TestRecordResults(RedditRecapTestCase):

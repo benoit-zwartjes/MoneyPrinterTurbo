@@ -9,6 +9,7 @@ writes a manifest and shells out to ``cli.py``.
     discover()        fetch → filter → split, skipping anything already made
     submit_parts()    hand parts to a renderer and record them as rendering
     sync_rendering()  promote in-flight parts once their task finishes
+    purge_discarded() delete what a rejected story's render produced anyway
     schedule_parts()  hand approved parts to Upload-Post on a calendar
     sync_uploads()    promote scheduled parts once Upload-Post has published
 
@@ -26,8 +27,9 @@ from loguru import logger
 
 from app.config import config
 from app.models import const
-from app.models.schema import VideoParams
+from app.models.schema import MaterialInfo, VideoParams
 from app.services import (
+    gameplay_library,
     reddit_apify,
     reddit_queue,
     reddit_script,
@@ -42,9 +44,29 @@ PROVIDERS = (PROVIDER_APIFY, PROVIDER_OFFICIAL)
 DEFAULT_PROVIDER = PROVIDER_APIFY
 
 DEFAULT_VIDEO_TERMS = "calm abstract background, slow motion texture, ambient loop"
-DEFAULT_VIDEO_SOURCE = "pexels"
 DEFAULT_VIDEO_ASPECT = "9:16"
 DEFAULT_VOICE_NAME = "en-US-AriaNeural-Female"
+
+# What plays behind the narration. Gameplay footage — Minecraft parkour and the
+# like — is what this format is watched with, so it is the default; the stock
+# libraries stay available for anyone who wants filler b-roll instead.
+BACKGROUND_GAMEPLAY = "gameplay"
+STOCK_BACKGROUNDS = ("pexels", "pixabay", "coverr")
+BACKGROUNDS = (BACKGROUND_GAMEPLAY, *STOCK_BACKGROUNDS)
+DEFAULT_BACKGROUND = BACKGROUND_GAMEPLAY
+
+# Subtitle look. Yellow on a black outline is the convention for this format and
+# survives a busy gameplay background, which white does not.
+DEFAULT_TEXT_COLOR = "#FFFF00"
+DEFAULT_STROKE_COLOR = "#000000"
+# Outline width in pixels. video.py casts this to an int, so the levels are
+# whole numbers rather than the 1.5 the main page defaults to.
+TEXT_THICKNESS = {"thin": 1, "medium": 3, "thick": 5, "extra thick": 8}
+DEFAULT_TEXT_THICKNESS = "thick"
+# Bold by default, so "thick" reads as thick letters and not only a thick
+# outline. Shipped in resource/fonts and covers Latin text.
+DEFAULT_FONT_NAME = "MicrosoftYaHeiBold.ttc"
+DEFAULT_FONT_SIZE = 60
 DEFAULT_CAPTION_TEMPLATE = "{title} (Part {index}/{total}) #reddit #story"
 
 # Upload-Post reports a scheduled job's outcome as a free-text status. Anything
@@ -86,6 +108,10 @@ def resolve_options(**overrides) -> dict:
     an explicit override, then ``[app] reddit_*`` in config.toml, then a default.
     """
     provider = str(_setting("provider", DEFAULT_PROVIDER) or DEFAULT_PROVIDER).strip()
+    background = str(_setting("background", DEFAULT_BACKGROUND) or DEFAULT_BACKGROUND).strip()
+    thickness = str(
+        _setting("text_thickness", DEFAULT_TEXT_THICKNESS) or DEFAULT_TEXT_THICKNESS
+    ).strip().lower()
     options = {
         "provider": provider if provider in PROVIDERS else DEFAULT_PROVIDER,
         "subreddits": _subreddit_list(_setting("subreddits", None)),
@@ -101,10 +127,17 @@ def resolve_options(**overrides) -> dict:
         "part_seconds": _int_setting("part_seconds", reddit_script.DEFAULT_PART_SECONDS),
         "max_parts": _int_setting("max_parts", reddit_script.DEFAULT_MAX_PARTS),
         "video_terms": str(_setting("video_terms", DEFAULT_VIDEO_TERMS) or DEFAULT_VIDEO_TERMS),
-        "video_source": str(_setting("video_source", DEFAULT_VIDEO_SOURCE) or DEFAULT_VIDEO_SOURCE),
+        "background": background if background in BACKGROUNDS else DEFAULT_BACKGROUND,
         "video_aspect": str(_setting("video_aspect", DEFAULT_VIDEO_ASPECT) or DEFAULT_VIDEO_ASPECT),
         "voice_name": str(_setting("voice_name", DEFAULT_VOICE_NAME) or DEFAULT_VOICE_NAME),
         "subtitle_enabled": _bool_setting("subtitle_enabled", True),
+        "text_color": str(_setting("text_color", DEFAULT_TEXT_COLOR) or DEFAULT_TEXT_COLOR),
+        "text_thickness": (
+            thickness if thickness in TEXT_THICKNESS else DEFAULT_TEXT_THICKNESS
+        ),
+        "stroke_color": str(_setting("stroke_color", DEFAULT_STROKE_COLOR) or DEFAULT_STROKE_COLOR),
+        "font_name": str(_setting("font_name", DEFAULT_FONT_NAME) or DEFAULT_FONT_NAME),
+        "font_size": _int_setting("font_size", DEFAULT_FONT_SIZE),
     }
 
     for key, value in overrides.items():
@@ -210,21 +243,75 @@ def discover(options: dict) -> list[dict]:
     return discover_report(options)["candidates"]
 
 
+def stroke_width_for(options: dict) -> int:
+    """The subtitle outline width one thickness level means, in pixels."""
+    return TEXT_THICKNESS.get(
+        str(options.get("text_thickness", DEFAULT_TEXT_THICKNESS)).lower(),
+        TEXT_THICKNESS[DEFAULT_TEXT_THICKNESS],
+    )
+
+
+def gameplay_clip_for(part: dict, options: dict) -> str:
+    """
+    The background clip one part plays over.
+
+    ``options['gameplay_clips']`` is the library as it looked when the batch
+    started, so a clip deleted mid-batch cannot renumber what the remaining
+    parts were assigned.
+    """
+    available = options.get("gameplay_clips")
+    if available is None:
+        available = gameplay_library.paths()
+    return gameplay_library.choose_clip(list(available), part.get("subject", ""))
+
+
+def with_gameplay_snapshot(options: dict) -> dict:
+    """
+    Freeze the library for one batch.
+
+    Parts submitted seconds apart should not be assigned from different views
+    of the library; a clip removed mid-batch would otherwise renumber the rest.
+    """
+    if options.get("background", DEFAULT_BACKGROUND) != BACKGROUND_GAMEPLAY:
+        return options
+    if options.get("gameplay_clips") is not None:
+        return options
+    return {**options, "gameplay_clips": gameplay_library.paths()}
+
+
 def build_video_params(part: dict, options: dict) -> VideoParams:
     """
     One part becomes one video.
 
     The script is supplied directly, so the LLM script stage is skipped —
     the whole point of a recap is to narrate the post, not to write about it.
+
+    A gameplay background renders as a local material rather than a stock
+    search: the footage is already on the server, so there is nothing to search
+    for and ``video_terms`` would only be dead weight in the task record.
     """
+    background = options.get("background", DEFAULT_BACKGROUND)
+    gameplay = background == BACKGROUND_GAMEPLAY
+
+    materials = None
+    if gameplay:
+        clip = gameplay_clip_for(part, options)
+        materials = [MaterialInfo(provider="local", url=clip)] if clip else None
+
     return VideoParams(
         video_subject=part["subject"],
         video_script=part["script"],
-        video_terms=options["video_terms"],
+        video_terms="" if gameplay else options["video_terms"],
         video_aspect=options["video_aspect"],
-        video_source=options["video_source"],
+        video_source="local" if gameplay else background,
+        video_materials=materials,
         voice_name=options["voice_name"],
         subtitle_enabled=options["subtitle_enabled"],
+        font_name=options.get("font_name", DEFAULT_FONT_NAME),
+        font_size=int(options.get("font_size", DEFAULT_FONT_SIZE)),
+        text_fore_color=options.get("text_color", DEFAULT_TEXT_COLOR),
+        stroke_color=options.get("stroke_color", DEFAULT_STROKE_COLOR),
+        stroke_width=stroke_width_for(options),
         video_count=1,
     )
 
@@ -239,6 +326,8 @@ def submit_parts(splits: list[dict], options: dict, submit) -> dict:
     """
     submitted = 0
     failed = 0
+
+    options = with_gameplay_snapshot(options)
 
     for split in splits:
         parts_meta = []
@@ -327,6 +416,34 @@ def sync_rendering(get_task) -> dict:
             failed += 1
 
     return {"rendered": promoted, "failed": failed}
+
+
+def purge_discarded(get_task) -> dict:
+    """
+    Delete what a render produced after its story was rejected.
+
+    A part rejected mid-render keeps rendering — the task pool has no cancel —
+    so its file lands minutes later with nothing tracking it. Nothing else ever
+    deletes that file, and on a server rendering all day it is the difference
+    between a stable disk and a full one.
+    """
+    purged = 0
+
+    for part in reddit_queue.discarded_parts():
+        task = get_task(part["task_id"])
+        if task and task.get("state") == const.TASK_STATE_PROCESSING:
+            # Still rendering. Deleting now would race the writer, so wait for
+            # the task to settle and pick it up on a later pass.
+            continue
+
+        if reddit_queue.delete_render_files(part):
+            purged += 1
+
+        # Stop following the part either way: an untracked task will never
+        # produce anything for us to clean up.
+        reddit_queue.update_part(part["post_id"], part["index"], task_id=None)
+
+    return {"purged": purged}
 
 
 def caption_for(part: dict) -> str:
@@ -516,6 +633,25 @@ def is_configured(provider: str | None = None) -> bool:
     if provider == PROVIDER_APIFY:
         return reddit_apify.is_configured()
     return reddit_source.is_configured()
+
+
+def background_issues(options: dict) -> list[str]:
+    """
+    Reasons the chosen background cannot render, as plain sentences.
+
+    An empty gameplay library fails late and unhelpfully otherwise: the render
+    reaches the materials stage and reports that no local material was found,
+    once per part.
+    """
+    if options.get("background", DEFAULT_BACKGROUND) != BACKGROUND_GAMEPLAY:
+        return []
+    if gameplay_library.is_ready():
+        return []
+    return [
+        "The gameplay library is empty, so there is no background to render "
+        "over. Upload a Minecraft parkour clip, or drop one into "
+        f"{gameplay_library.library_dir(create=False)} on the server."
+    ]
 
 
 def blocking_issues(provider: str | None = None) -> list[str]:

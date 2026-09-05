@@ -388,19 +388,30 @@ def sync_once(poll_uploads: bool | None = None) -> dict:
     """
     One pass of the work that has to happen whether or not anyone is looking.
 
-    Renders finish in the task pool and uploads finish on Upload-Post's side;
-    both leave the queue stale until something reads their outcome. Promoting a
+    Renders finish in the task pool, uploads finish on Upload-Post's side, and
+    a render whose story was rejected still writes a file; all three leave
+    something stale until a pass reads them. Promoting a
     render is a local file read, so it happens every pass; polling uploads is a
     paid API call per scheduled part, so by default it only happens once the
     interval is due. ``poll_uploads`` forces or suppresses that decision.
     """
     global _last_upload_sync
 
-    outcome = {"rendered": 0, "render_failed": 0, "uploaded": 0, "upload_failed": 0}
+    outcome = {
+        "rendered": 0,
+        "render_failed": 0,
+        "uploaded": 0,
+        "upload_failed": 0,
+        "purged": 0,
+    }
 
     rendering = reddit_pipeline.sync_rendering(sm.state.get_task)
     outcome["rendered"] = rendering["rendered"]
     outcome["render_failed"] = rendering["failed"]
+
+    # A story rejected mid-render leaves its video behind when the task
+    # finishes; this is what clears it.
+    outcome["purged"] = reddit_pipeline.purge_discarded(sm.state.get_task)["purged"]
 
     due = (
         poll_uploads

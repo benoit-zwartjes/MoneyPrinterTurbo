@@ -42,6 +42,7 @@ nobody watching it.
 | `webui/pages/1_Reddit_Recaps.py` | The whole workflow as a page |
 | `app/services/reddit_pipeline.py` | Shared orchestration and the backend switch |
 | `app/services/reddit_jobs.py` | Background jobs, their persisted state, and the worker |
+| `app/services/gameplay_library.py` | The Minecraft parkour clips every render plays over |
 | `app/services/reddit_apify.py` | Apify actor backend |
 | `app/services/reddit_source.py` | Official Reddit API backend |
 | `app/services/reddit_script.py` | Markdown → narration, jargon, part splitting |
@@ -138,7 +139,9 @@ every step of it runs on the server:
 4. Untick what you do not want and **Render** — parts go to the same background
    task pool the main page uses, and the worker moves them into the review queue
    as each render finishes, whether or not the page is open.
-5. **2 · Review** — watch each part, then approve or reject the story.
+5. **2 · Review** — watch each part, then approve or reject the story. A story
+   still rendering can be **stopped** from here. See *Rejecting* below for what
+   rejecting keeps and what it deletes.
 6. **3 · Schedule** — pick a first slot and an interval; approved parts are
    handed to Upload-Post in story order, so part 1 always lands before part 2.
    The uploads themselves run as a background job, so a batch of large files
@@ -213,6 +216,72 @@ the two will fight for CPU otherwise.
 
 Leave the publish step manual, or add a second task once you trust the output.
 
+## Background footage
+
+Recaps play over gameplay footage rather than stock b-roll, because that is what
+the format is watched with. `reddit_background = "gameplay"` uses the clip
+library; `pexels`, `pixabay` and `coverr` still search stock video with
+`reddit_video_terms` instead.
+
+The library is `storage/local_videos/gameplay`. That parent directory is not
+cosmetic: `video.preprocess_video` refuses to read a local material from
+anywhere else, so a library outside it would look fine in the page and be
+dropped at render time.
+
+Two ways to fill it:
+
+* **Upload** on the page, under *Gameplay clips*. Validation and the 200 MB
+  limit are the same ones the main page's local materials use.
+* **Drop files into the folder** over a mounted volume or SFTP. A ten-minute
+  parkour clip is usually past what a browser upload is worth; anything in the
+  folder is listed whether or not the page ever saw it.
+
+One clip backs one part, picked by hashing the part's subject: parts of a story
+spread across the library, and re-rendering a part picks the same clip again
+rather than quietly changing the look of one video in a published set. The
+render then cuts that clip into segments the usual way, so a single long
+recording gives every part different footage.
+
+Rendering is blocked while the library is empty, with the reason on the page —
+otherwise every part fails separately at the materials stage, minutes after the
+click that caused it.
+
+## Subtitles
+
+Defaults are thick yellow on a black outline: white disappears into bright
+gameplay footage, and a thin outline disappears into everything.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `reddit_text_color` | `#FFFF00` | Fill colour of the caption |
+| `reddit_text_thickness` | `thick` | Outline weight: thin, medium, thick, extra thick |
+| `reddit_stroke_color` | `#000000` | Outline colour |
+| `reddit_font_name` | `MicrosoftYaHeiBold.ttc` | Bold, so "thick" is thick letters too |
+| `reddit_font_size` | `60` | Caption size in the 1080-wide frame |
+
+Colour, thickness and size are on the page under *Parts and video*, with a
+preview strip. They apply to renders started from the page and to
+`scripts/reddit_recap.py`, which writes them into the cli.py manifest.
+
+## Rejecting a story
+
+Rejecting is where a story stops. With `reddit_reject_discards_videos = true`
+(the default, and a checkbox in *Review*):
+
+* every part still rendering is rejected too, so nothing promotes it into the
+  review queue later;
+* every video already written is deleted, and the file a still-running render
+  produces afterwards is deleted by the worker when that task finishes — the
+  task pool has no cancel, so the render finishes into the bin;
+* the story itself stays: title, subreddit, permalink, and the narration of
+  every part, readable under *All stories*.
+
+That is the point of the setting — a rejected story is worth keeping as text
+even when its footage is not worth the disk. Turn it off to keep the videos.
+
+Post IDs of rejected stories stay in the dedup set either way, so a rejected
+thread is not offered again on the next search.
+
 ## Part shape
 
 `reddit_part_seconds` is a narration target, not a hard cut. The title (part 1)
@@ -264,6 +333,10 @@ factors.
 
 **Attribution.** The permalink is stored on every queued post and goes into the
 YouTube description by default via `reddit_caption_template` and the scheduler.
+
+**Gameplay footage is somebody's recording.** A Minecraft parkour clip pulled
+from YouTube belongs to whoever made it, and both YouTube and TikTok act on
+reused content. Record your own, or use footage licensed for reuse.
 
 **Dedup is by post ID**, kept in `storage/reddit_recaps.json` and capped at 1000
 posts, oldest dropped first. Delete that file and the next run will happily
