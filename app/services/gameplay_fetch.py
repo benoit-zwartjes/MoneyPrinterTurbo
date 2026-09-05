@@ -81,7 +81,10 @@ def is_available() -> bool:
 def unavailable_reason() -> str:
     return (
         "yt-dlp is not installed, so gameplay clips cannot be downloaded. "
-        "Run `uv sync` on the server, or add clips by hand."
+        "On a Docker or Coolify deployment, rebuild the image so the new "
+        "requirements.txt is installed. From a source checkout, run `uv sync`. "
+        "Either way, uploading clips or dropping them into the library folder "
+        "still works."
     )
 
 

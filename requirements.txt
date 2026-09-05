@@ -20,3 +20,7 @@ socksio==1.0.0
 pydub==0.25.1
 audioop-lts==0.2.2; python_version >= "3.13"
 litellm==1.86.2
+# Unpinned deliberately, unlike everything above: yt-dlp tracks YouTube's
+# extractors, which break every few weeks, and a pinned version stops fetching
+# gameplay clips until somebody notices and bumps it.
+yt-dlp>=2025.12.22
